@@ -29,12 +29,14 @@
 #include <time.h>
 #include <errno.h>
 #include <strings.h>
+#include <pthread.h>
 #include "rdesktop.h"
 #include "xproto.h"
 #ifdef HAVE_XRANDR
 #include <X11/extensions/Xrandr.h>
 #endif
 
+extern void SurgeAdjustImage(XImage *image);
 extern int g_sizeopt;
 extern int g_width;
 extern int g_height;
@@ -156,7 +158,10 @@ static int g_red_shift_l, g_blue_shift_l, g_green_shift_l;
 
 /* software backing store */
 extern RD_BOOL g_ownbackstore;
+extern int g_surge;
 static Pixmap g_backstore = 0;
+static XImage *g_backstore2 = 0;
+static Pixmap g_backstore3 = 0;
 
 /* Moving in single app mode */
 static RD_BOOL g_moving_wnd;
@@ -188,6 +193,23 @@ typedef struct
 	uint32 blue;
 }
 PixelColour;
+
+static int g_dirty = 0;
+static int g_running = 0;
+
+static void BackgroundBackStoreStartup();
+static void BackgroundBackStoreShutdown();
+static int BackgroundBackStoreAddN(int *n, fd_set *rdfs);
+
+static int
+OnUpdateBackStore()
+{
+	if (g_surge < 0) return 0;
+	g_dirty = 1;
+	return 1;
+}
+
+#define g_direct (g_backstore3 == 0)
 
 #define ON_ALL_SEAMLESS_WINDOWS(func, args) \
         do { \
@@ -225,25 +247,33 @@ seamless_XDrawLines(Drawable d, XPoint * points, int npoints, int xoffset, int y
 	points[0].y += yoffset;
 }
 
-#define FILL_RECTANGLE(x,y,cx,cy)\
-{ \
-	XFillRectangle(g_display, g_wnd, g_gc, x, y, cx, cy); \
-        ON_ALL_SEAMLESS_WINDOWS(XFillRectangle, (g_display, sw->wnd, g_gc, x-sw->xoffset, y-sw->yoffset, cx, cy)); \
-	if (g_ownbackstore) \
-		XFillRectangle(g_display, g_backstore, g_gc, x, y, cx, cy); \
-}
-
 #define FILL_RECTANGLE_BACKSTORE(x,y,cx,cy)\
 { \
 	XFillRectangle(g_display, g_ownbackstore ? g_backstore : g_wnd, g_gc, x, y, cx, cy); \
 }
 
+#define PFM_ACTION(func, args, seamlessfunc, seamlessargs)\
+{ \
+	Pixmap whence = g_backstore; \
+	if (g_ownbackstore) \
+		func args; \
+	whence = g_wnd; \
+	if (!OnUpdateBackStore()) { \
+		func args; \
+		ON_ALL_SEAMLESS_WINDOWS(seamlessfunc, seamlessargs);\
+	} \
+}
+
+#define FILL_RECTANGLE(x,y,cx,cy)\
+{ \
+	PFM_ACTION(XFillRectangle, (g_display, whence, g_gc, x, y, cx, cy), \
+		XFillRectangle, (g_display, sw->wnd, g_gc, x-sw->xoffset, y-sw->yoffset, cx, cy)); \
+}
+
 #define FILL_POLYGON(p,np)\
 { \
-	XFillPolygon(g_display, g_wnd, g_gc, p, np, Complex, CoordModePrevious); \
-	if (g_ownbackstore) \
-		XFillPolygon(g_display, g_backstore, g_gc, p, np, Complex, CoordModePrevious); \
-	ON_ALL_SEAMLESS_WINDOWS(seamless_XFillPolygon, (sw->wnd, p, np, sw->xoffset, sw->yoffset)); \
+	PFM_ACTION(XFillPolygon, (g_display, whence, g_gc, p, np, Complex, CoordModePrevious), \
+		seamless_XFillPolygon, (sw->wnd, p, np, sw->xoffset, sw->yoffset)); \
 }
 
 #define DRAW_ELLIPSE(x,y,cx,cy,m)\
@@ -251,16 +281,12 @@ seamless_XDrawLines(Drawable d, XPoint * points, int npoints, int xoffset, int y
 	switch (m) \
 	{ \
 		case 0:	/* Outline */ \
-			XDrawArc(g_display, g_wnd, g_gc, x, y, cx, cy, 0, 360*64); \
-                        ON_ALL_SEAMLESS_WINDOWS(XDrawArc, (g_display, sw->wnd, g_gc, x-sw->xoffset, y-sw->yoffset, cx, cy, 0, 360*64)); \
-			if (g_ownbackstore) \
-				XDrawArc(g_display, g_backstore, g_gc, x, y, cx, cy, 0, 360*64); \
+			PFM_ACTION(XDrawArc, (g_display, whence, g_gc, x, y, cx, cy, 0, 360*64), \
+                        	XDrawArc, (g_display, sw->wnd, g_gc, x-sw->xoffset, y-sw->yoffset, cx, cy, 0, 360*64)); \
 			break; \
 		case 1: /* Filled */ \
-			XFillArc(g_display, g_wnd, g_gc, x, y, cx, cy, 0, 360*64); \
-			ON_ALL_SEAMLESS_WINDOWS(XFillArc, (g_display, sw->wnd, g_gc, x-sw->xoffset, y-sw->yoffset, cx, cy, 0, 360*64)); \
-			if (g_ownbackstore) \
-				XFillArc(g_display, g_backstore, g_gc, x, y, cx, cy, 0, 360*64); \
+			PFM_ACTION(XFillArc, (g_display, whence, g_gc, x, y, cx, cy, 0, 360*64), \
+				XFillArc, (g_display, sw->wnd, g_gc, x-sw->xoffset, y-sw->yoffset, cx, cy, 0, 360*64)); \
 			break; \
 	} \
 }
@@ -1852,7 +1878,7 @@ set_wm_client_machine(Display * dpy, Window win)
 	if (gethostname(hostname, sizeof(hostname)) != 0)
 		return;
 
-	tp.value = hostname;
+	tp.value = (unsigned char *)hostname;
 	tp.nitems = strlen(hostname);
 	tp.encoding = XA_STRING;
 	tp.format = 8;
@@ -2080,6 +2106,12 @@ ui_create_window(void)
 		/* clear to prevent rubbish being exposed at startup */
 		XSetForeground(g_display, g_gc, BlackPixelOfScreen(g_screen));
 		XFillRectangle(g_display, g_backstore, g_gc, 0, 0, g_width, g_height);
+
+		if (g_surge >= 0)
+		{
+			g_backstore3 = XCreatePixmap(g_display, g_wnd, g_width, g_height, g_depth);
+			XFillRectangle(g_display, g_backstore3, g_gc, 0, 0, g_width, g_height);
+		}
 	}
 
 	XStoreName(g_display, g_wnd, g_title);
@@ -2191,6 +2223,11 @@ ui_resize_window()
 	/* create new backstore pixmap */
 	if (g_backstore != 0)
 	{
+		if (!g_direct)
+		{
+			/* TODO FIXME */
+			exit(3);
+		}
 		bs = XCreatePixmap(g_display, g_wnd, g_width, g_height, g_depth);
 		XSetForeground(g_display, g_gc, BlackPixelOfScreen(g_screen));
 		XFillRectangle(g_display, bs, g_gc, 0, 0, g_width, g_height);
@@ -2219,6 +2256,17 @@ ui_destroy_window(void)
 
 	if (g_backstore)
 	{
+		if (!g_direct)
+		{
+			/* TODO: Gather thread */
+			if (g_backstore2 != 0)
+			{
+				XDestroyImage(g_backstore2);
+				g_backstore2 = 0;
+			}
+			XFreePixmap(g_display, g_backstore3);
+			g_backstore = 0;
+		}
 		XFreePixmap(g_display, g_backstore);
 		g_backstore = 0;
 	}
@@ -2574,8 +2622,8 @@ xwin_process_events(void)
 			case Expose:
 				if (xevent.xexpose.window == g_wnd)
 				{
-					XCopyArea(g_display, g_backstore, xevent.xexpose.window,
-						  g_gc,
+					XCopyArea(g_display, g_direct ? g_backstore : g_backstore3,
+						  xevent.xexpose.window, g_gc,
 						  xevent.xexpose.x, xevent.xexpose.y,
 						  xevent.xexpose.width, xevent.xexpose.height,
 						  xevent.xexpose.x, xevent.xexpose.y);
@@ -2585,7 +2633,7 @@ xwin_process_events(void)
 					sw = sw_get_window_by_wnd(xevent.xexpose.window);
 					if (!sw)
 						break;
-					XCopyArea(g_display, g_backstore,
+					XCopyArea(g_display, g_direct ? g_backstore : g_backstore3,
 						  xevent.xexpose.window, g_gc,
 						  xevent.xexpose.x + sw->xoffset,
 						  xevent.xexpose.y + sw->yoffset,
@@ -2709,12 +2757,15 @@ int
 ui_select(int rdp_socket)
 {
 	int n;
+	int h_bkg;
 	fd_set rfds, wfds;
 	struct timeval tv;
 	RD_BOOL s_timeout = False;
 
 	while (True)
 	{
+		if (g_dirty) BackgroundBackStoreStartup();
+
 		n = (rdp_socket > g_x_socket) ? rdp_socket : g_x_socket;
 		/* Process any events already waiting */
 		if (!xwin_process_events())
@@ -2747,6 +2798,8 @@ ui_select(int rdp_socket)
 		/* add ctrl slaves handles */
 		ctrl_add_fds(&n, &rfds);
 
+		h_bkg = BackgroundBackStoreAddN(&n, &rfds);
+
 		n++;
 
 		switch (select(n, &rfds, &wfds, NULL, &tv))
@@ -2773,6 +2826,9 @@ ui_select(int rdp_socket)
 		rdpdr_check_fds(&rfds, &wfds, (RD_BOOL) False);
 
 		ctrl_check_fds(&rfds, &wfds);
+
+		if (h_bkg >= 0 && FD_ISSET(h_bkg, &rfds))
+			BackgroundBackStoreShutdown();
 
 		if (FD_ISSET(rdp_socket, &rfds))
 			return 1;
@@ -2845,10 +2901,13 @@ ui_paint_bitmap(int x, int y, int cx, int cy, int width, int height, uint8 * dat
 	if (g_ownbackstore)
 	{
 		XPutImage(g_display, g_backstore, g_gc, image, 0, 0, x, y, cx, cy);
-		XCopyArea(g_display, g_backstore, g_wnd, g_gc, x, y, cx, cy, x, y);
-		ON_ALL_SEAMLESS_WINDOWS(XCopyArea,
+		if (!OnUpdateBackStore())
+		{
+			XCopyArea(g_display, g_backstore, g_wnd, g_gc, x, y, cx, cy, x, y);
+			ON_ALL_SEAMLESS_WINDOWS(XCopyArea,
 					(g_display, g_backstore, sw->wnd, g_gc, x, y, cx, cy,
 					 x - sw->xoffset, y - sw->yoffset));
+		}
 	}
 	else
 	{
@@ -3313,11 +3372,14 @@ ui_patblt(uint8 opcode,
 
 	RESET_FUNCTION(opcode);
 
-	if (g_ownbackstore)
-		XCopyArea(g_display, g_backstore, g_wnd, g_gc, x, y, cx, cy, x, y);
-	ON_ALL_SEAMLESS_WINDOWS(XCopyArea,
+	if (!OnUpdateBackStore())
+	{
+		if (g_ownbackstore)
+			XCopyArea(g_display, g_backstore, g_wnd, g_gc, x, y, cx, cy, x, y);
+		ON_ALL_SEAMLESS_WINDOWS(XCopyArea,
 				(g_display, g_ownbackstore ? g_backstore : g_wnd, sw->wnd, g_gc,
 				 x, y, cx, cy, x - sw->xoffset, y - sw->yoffset));
+	}
 }
 
 void
@@ -3326,18 +3388,23 @@ ui_screenblt(uint8 opcode,
 	     /* src */ int srcx, int srcy)
 {
 	SET_FUNCTION(opcode);
+	int seamless = 1;
 	if (g_ownbackstore)
 	{
-		XCopyArea(g_display, g_Unobscured ? g_wnd : g_backstore,
-			  g_wnd, g_gc, srcx, srcy, cx, cy, x, y);
 		XCopyArea(g_display, g_backstore, g_backstore, g_gc, srcx, srcy, cx, cy, x, y);
+		if (!OnUpdateBackStore())
+			XCopyArea(g_display, g_Unobscured ? g_wnd : g_backstore,
+				g_wnd, g_gc, srcx, srcy, cx, cy, x, y);
+		else
+			seamless = 0;
 	}
 	else
 	{
 		XCopyArea(g_display, g_wnd, g_wnd, g_gc, srcx, srcy, cx, cy, x, y);
 	}
 
-	ON_ALL_SEAMLESS_WINDOWS(XCopyArea,
+	if (seamless)
+		ON_ALL_SEAMLESS_WINDOWS(XCopyArea,
 				(g_display, g_ownbackstore ? g_backstore : g_wnd,
 				 sw->wnd, g_gc, x, y, cx, cy, x - sw->xoffset, y - sw->yoffset));
 
@@ -3350,12 +3417,15 @@ ui_memblt(uint8 opcode,
 	  /* src */ RD_HBITMAP src, int srcx, int srcy)
 {
 	SET_FUNCTION(opcode);
-	XCopyArea(g_display, (Pixmap) src, g_wnd, g_gc, srcx, srcy, cx, cy, x, y);
-	ON_ALL_SEAMLESS_WINDOWS(XCopyArea,
-				(g_display, (Pixmap) src, sw->wnd, g_gc,
-				 srcx, srcy, cx, cy, x - sw->xoffset, y - sw->yoffset));
 	if (g_ownbackstore)
 		XCopyArea(g_display, (Pixmap) src, g_backstore, g_gc, srcx, srcy, cx, cy, x, y);
+	if (!OnUpdateBackStore())
+	{
+		XCopyArea(g_display, (Pixmap) src, g_wnd, g_gc, srcx, srcy, cx, cy, x, y);
+		ON_ALL_SEAMLESS_WINDOWS(XCopyArea,
+			(g_display, (Pixmap) src, sw->wnd, g_gc,
+			 srcx, srcy, cx, cy, x - sw->xoffset, y - sw->yoffset));
+	}
 	RESET_FUNCTION(opcode);
 }
 
@@ -3399,12 +3469,15 @@ ui_line(uint8 opcode,
 {
 	SET_FUNCTION(opcode);
 	SET_FOREGROUND(pen->colour);
-	XDrawLine(g_display, g_wnd, g_gc, startx, starty, endx, endy);
-	ON_ALL_SEAMLESS_WINDOWS(XDrawLine, (g_display, sw->wnd, g_gc,
-					    startx - sw->xoffset, starty - sw->yoffset,
-					    endx - sw->xoffset, endy - sw->yoffset));
 	if (g_ownbackstore)
 		XDrawLine(g_display, g_backstore, g_gc, startx, starty, endx, endy);
+	if (!OnUpdateBackStore())
+	{
+		XDrawLine(g_display, g_wnd, g_gc, startx, starty, endx, endy);
+		ON_ALL_SEAMLESS_WINDOWS(XDrawLine, (g_display, sw->wnd, g_gc,
+					    startx - sw->xoffset, starty - sw->yoffset,
+					    endx - sw->xoffset, endy - sw->yoffset));
+	}
 	RESET_FUNCTION(opcode);
 }
 
@@ -3523,13 +3596,15 @@ ui_polyline(uint8 opcode,
 	/* TODO: set join style */
 	SET_FUNCTION(opcode);
 	SET_FOREGROUND(pen->colour);
-	XDrawLines(g_display, g_wnd, g_gc, (XPoint *) points, npoints, CoordModePrevious);
 	if (g_ownbackstore)
 		XDrawLines(g_display, g_backstore, g_gc, (XPoint *) points, npoints,
 			   CoordModePrevious);
-
-	ON_ALL_SEAMLESS_WINDOWS(seamless_XDrawLines,
+	if (!OnUpdateBackStore())
+	{
+		XDrawLines(g_display, g_wnd, g_gc, (XPoint *) points, npoints, CoordModePrevious);
+		ON_ALL_SEAMLESS_WINDOWS(seamless_XDrawLines,
 				(sw->wnd, (XPoint *) points, npoints, sw->xoffset, sw->yoffset));
+	}
 
 	RESET_FUNCTION(opcode);
 }
@@ -3638,6 +3713,7 @@ ui_draw_glyph(int mixmode,
 	FILL_RECTANGLE_BACKSTORE(x, y, cx, cy);
 
 	XSetFillStyle(g_display, g_gc, FillSolid);
+	OnUpdateBackStore();
 }
 
 #define DO_GLYPH(ttext,idx) \
@@ -3771,7 +3847,7 @@ ui_draw_text(uint8 font, uint8 flags, uint8 opcode, int mixmode, int x, int y,
 
 	XSetFillStyle(g_display, g_gc, FillSolid);
 
-	if (g_ownbackstore)
+	if (g_ownbackstore && !OnUpdateBackStore())
 	{
 		if (boxcx > 1)
 		{
@@ -3839,10 +3915,13 @@ ui_desktop_restore(uint32 offset, int x, int y, int cx, int cy)
 	if (g_ownbackstore)
 	{
 		XPutImage(g_display, g_backstore, g_gc, image, 0, 0, x, y, cx, cy);
-		XCopyArea(g_display, g_backstore, g_wnd, g_gc, x, y, cx, cy, x, y);
-		ON_ALL_SEAMLESS_WINDOWS(XCopyArea,
+		if (!OnUpdateBackStore())
+		{
+			XCopyArea(g_display, g_backstore, g_wnd, g_gc, x, y, cx, cy, x, y);
+			ON_ALL_SEAMLESS_WINDOWS(XCopyArea,
 					(g_display, g_backstore, sw->wnd, g_gc,
 					 x, y, cx, cy, x - sw->xoffset, y - sw->yoffset));
+		}
 	}
 	else
 	{
@@ -4467,11 +4546,72 @@ ui_seamless_ack(unsigned int serial)
 			/* Do a complete redraw of the window as part of the
 			   completion of the move. This is to remove any
 			   artifacts caused by our lack of synchronization. */
-			XCopyArea(g_display, g_backstore,
+			XCopyArea(g_display, g_backstore3 ? g_backstore3 : g_backstore,
 				  sw->wnd, g_gc,
 				  sw->xoffset, sw->yoffset, sw->width, sw->height, 0, 0);
 
 			break;
 		}
 	}
+}
+
+static int g_bkrh[2] = {-1, -1};
+static int g_bkwh[2] = {-1, -1};
+
+static void *BackgroundWorker(void *ignored)
+{
+	ignored = NULL;
+	for(;;) {
+		read(g_bkwh[0], &ignored, 1);
+		SurgeAdjustImage(g_backstore2);
+		write(g_bkrh[1], &ignored, 1);
+	}
+	return NULL; /* unreachable -- shut up warning */
+}
+
+static int
+BackgroundBackStoreAddN(int *n, fd_set *rdfs)
+{
+	if (g_bkrh[0] < 0) return -1;
+	if (*n < g_bkrh[0])
+		*n = g_bkrh[0];
+	FD_SET(g_bkrh[0], rdfs);
+	return g_bkrh[0];
+}
+
+static void
+BackgroundBackStoreStartup()
+{
+	if (!g_dirty || g_running) return ;
+	if (g_bkrh[0] < 0) {
+		pthread_t useless;
+		if (pipe(g_bkrh)) {
+			logger(Core, Error, "Unable to create internal pipe");
+			exit(3);
+		}
+		if (pipe(g_bkwh)) {
+			logger(Core, Error, "Unable to create internal pipe (2)");
+			exit(3);
+		}
+		if (pthread_create(&useless, NULL, BackgroundWorker, NULL)) {
+			logger(Core, Error, "Unable to create background worker thread");
+			exit(3);
+		}
+	}
+	g_backstore2 = XGetImage(g_display, g_backstore, 0, 0, g_width, g_height, AllPlanes, ZPixmap);
+	write(g_bkwh[1], &g_running, 1);
+	g_dirty = 0;
+	g_running = 1;
+}
+
+static void
+BackgroundBackStoreShutdown()
+{
+	char ignored;
+	read(g_bkrh[0], &ignored, 1);
+	g_running = 0;
+	XPutImage(g_display, g_backstore3, g_gc, g_backstore2, 0, 0, 0, 0, g_width, g_height);
+	XPutImage(g_display, g_wnd, g_gc, g_backstore2, 0, 0, 0, 0, g_width, g_height);
+	if (g_dirty) BackgroundBackStoreStartup();
+	/* TODO SeamlessRDP */
 }

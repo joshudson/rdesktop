@@ -83,6 +83,7 @@ int g_pos = 0;			/* 0 position unspecified,
 extern int g_tcp_port_rdp;
 int g_server_depth = -1;
 int g_win_button_size = 0;	/* If zero, disable single app mode */
+int g_surge = -1;		/* If -1, disabled */
 RD_BOOL g_network_error = False;
 RD_BOOL g_bitmap_compression = True;
 RD_BOOL g_sendmotion = True;
@@ -254,8 +255,10 @@ usage(char *program)
 	fprintf(stderr, "   -0: attach to console\n");
 	fprintf(stderr, "   -4: use RDP version 4\n");
 	fprintf(stderr, "   -5: use RDP version 5 (default)\n");
-#ifdef WITH_SCARD
 	fprintf(stderr, "   -o: name=value: Adds an additional option to rdesktop.\n");
+	fprintf(stderr, "   surge              Specifies brightness surge protector as maximum\n");
+	fprintf(stderr, "                      percent window brightness allowed\n");
+#ifdef WITH_SCARD
 	fprintf(stderr,
 		"           sc-csp-name        Specifies the Crypto Service Provider name which\n");
 	fprintf(stderr,
@@ -700,7 +703,7 @@ main(int argc, char *argv[])
 					g_dpi = strtol(p + 1, &p, 10);
 					if (g_dpi <= 0)
 					{
-						error("invalid geometry\n");
+						logger(Core, Error, "invalid geometry\n");
 						return EX_USAGE;
 					}
 				}
@@ -951,7 +954,6 @@ main(int argc, char *argv[])
 			case '5':
 				g_rdp_version = RDP_V5;
 				break;
-#if WITH_SCARD
 			case 'o':
 				{
 					char *p = strchr(optarg, '=');
@@ -962,8 +964,19 @@ main(int argc, char *argv[])
 						       optarg);
 						continue;
 					}
-
-					if (strncmp(optarg, "sc-csp-name", strlen("sc-scp-name")) ==
+					if (strncmp(optarg, "surge", 5) == 0)
+					{
+						char *eptr;
+						int n = strtol(p + 1, &eptr, 10);
+						if (eptr == p + 1 || n < 0 || n > 100)
+						{
+							logger(Core, Warning, "Invalid value '%s' for surge", p);
+							continue;
+						}
+						g_surge = n;
+					}
+#if WITH_SCARD
+					else if (strncmp(optarg, "sc-csp-name", strlen("sc-scp-name")) ==
 					    0)
 						g_sc_csp_name = strdup(p + 1);
 					else if (strncmp
@@ -978,10 +991,14 @@ main(int argc, char *argv[])
 						 (optarg, "sc-container-name",
 						  strlen("sc-container-name")) == 0)
 						g_sc_container_name = strdup(p + 1);
-
+#endif
+					else
+					{
+						logger(Core, Warning, "Skipping unrecognized option '%s'", optarg);
+						continue;
+					}
 				}
 				break;
-#endif
 			case 'v':
 				logger_set_verbose(1);
 				break;
@@ -998,6 +1015,7 @@ main(int argc, char *argv[])
 		usage(argv[0]);
 		return EX_USAGE;
 	}
+	if (g_surge >= 0) g_ownbackstore = True;
 
 	STRNCPY(server, argv[optind], sizeof(server));
 	parse_server_and_port(server);
