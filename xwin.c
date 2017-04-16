@@ -4565,6 +4565,11 @@ ui_seamless_ack(unsigned int serial)
 static int g_bkrh[2] = {-1, -1};
 static int g_bkwh[2] = {-1, -1};
 
+#ifdef PROFILE
+static struct timeval measure_start;
+static struct timeval measure_stop;
+#endif
+
 static void *BackgroundWorker(void *ignored)
 {
 	ignored = NULL;
@@ -4605,6 +4610,9 @@ BackgroundBackStoreStartup()
 			exit(3);
 		}
 	}
+#ifdef PROFILE
+	gettimeofday(&measure_start, NULL);
+#endif
 	g_backstore2 = XGetImage(g_display, g_backstore, 0, 0, g_width, g_height, AllPlanes, ZPixmap);
 	write(g_bkwh[1], &g_running, 1);
 	g_dirty = 0;
@@ -4614,11 +4622,28 @@ BackgroundBackStoreStartup()
 static void
 BackgroundBackStoreShutdown()
 {
+#ifdef PROFILE
+	struct timeval tv_diff;
+#endif
 	char ignored;
 	read(g_bkrh[0], &ignored, 1);
 	g_running = 0;
-	XPutImage(g_display, g_backstore3, g_gc, g_backstore2, 0, 0, 0, 0, g_width, g_height);
 	XPutImage(g_display, g_wnd, g_gc, g_backstore2, 0, 0, 0, 0, g_width, g_height);
+	XPutImage(g_display, g_backstore3, g_gc, g_backstore2, 0, 0, 0, 0, g_width, g_height);
+	XFree(g_backstore2);
+	g_backstore2 = NULL;
+#ifdef PROFILE
+	gettimeofday(&measure_stop, NULL);
+#endif
+#ifdef PROFILE
+	tv_diff.tv_sec = measure_stop.tv_sec - measure_start.tv_sec;
+	if (measure_stop.tv_usec < measure_start.tv_usec) {
+		tv_diff.tv_sec -= 1;
+		tv_diff.tv_usec = 1000000 + measure_stop.tv_usec - measure_start.tv_usec;
+	} else
+		tv_diff.tv_usec = measure_stop.tv_usec - measure_start.tv_usec;
+	printf("Elapsed: %d.%06u\n", (int)tv_diff.tv_sec, (unsigned)tv_diff.tv_usec);
+#endif
 	if (g_dirty) BackgroundBackStoreStartup();
 	/* TODO SeamlessRDP */
 }
