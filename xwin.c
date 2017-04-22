@@ -24,6 +24,9 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xproto.h>
+#include <X11/extensions/XShm.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 #include <unistd.h>
 #include <sys/time.h>
 #include <time.h>
@@ -35,6 +38,8 @@
 #ifdef HAVE_XRANDR
 #include <X11/extensions/Xrandr.h>
 #endif
+
+/*#define PROFILE*/
 
 extern void SurgeAdjustImage(XImage *image);
 extern int g_sizeopt;
@@ -161,6 +166,8 @@ extern RD_BOOL g_ownbackstore;
 extern int g_surge;
 static Pixmap g_backstore = 0;
 static XImage *g_backstore2 = 0;
+static XShmSegmentInfo g_backstore2_shminfo;
+static RD_BOOL g_backstore2_shm = 0;
 static Pixmap g_backstore3 = 0;
 
 /* Moving in single app mode */
@@ -2116,8 +2123,41 @@ ui_create_window(void)
 
 		if (g_surge >= 0)
 		{
+			int localdepth = 24;
 			g_backstore3 = XCreatePixmap(g_display, g_wnd, g_width, g_height, g_depth);
 			XFillRectangle(g_display, g_backstore3, g_gc, 0, 0, g_width, g_height);
+
+			/* This way of detecting depth works, but can return 32 when 24 must be used. */
+			g_backstore2 = XGetImage(g_display, RootWindow(g_display, 0), 0, 0, 4, 4,
+					AllPlanes, ZPixmap);
+			if (g_backstore2 != NULL) {
+				localdepth = g_backstore2->bitmap_pad;
+				XFree(g_backstore2);
+			}
+
+			g_backstore2_shm = 0;
+			g_backstore2 = NULL;
+			XFlush(g_display);
+			if (XShmQueryExtension(g_display))
+				g_backstore2 = XShmCreateImage(g_display, g_visual, localdepth > 24 ? 24 : localdepth,
+					ZPixmap, NULL, &g_backstore2_shminfo, g_width, g_height);
+			if (g_backstore2 != NULL) {
+				g_backstore2_shminfo.shmid = shmget(IPC_PRIVATE,
+					g_backstore2->bytes_per_line * g_backstore2->height, IPC_CREAT|0777);
+				if (g_backstore2_shminfo.shmid == -1)
+					logger(GUI, Error, "shmget failed.");
+				g_backstore2_shminfo.shmaddr =
+					g_backstore2->data = shmat(g_backstore2_shminfo.shmid, 0, 0);
+				if (g_backstore2_shminfo.shmaddr == (void*)-1)
+					logger(GUI, Error, "shmat failed.");
+				g_backstore2_shminfo.readOnly = 0;
+				if (XShmAttach(g_display, &g_backstore2_shminfo)) {
+					g_backstore2_shm = 1;
+				} else {
+					logger(GUI, Warning, "XShmAttached failed.");
+				}
+			} else
+				logger(GUI, Warning, "XShm not supported; lag will be terrible.");
 		}
 	}
 
@@ -4611,9 +4651,13 @@ BackgroundBackStoreStartup()
 		}
 	}
 #ifdef PROFILE
+	XFlush(g_display);
 	gettimeofday(&measure_start, NULL);
 #endif
-	g_backstore2 = XGetImage(g_display, g_backstore, 0, 0, g_width, g_height, AllPlanes, ZPixmap);
+	if (g_backstore2_shm)
+		XShmGetImage(g_display, g_backstore, g_backstore2, 0, 0, AllPlanes);
+	else
+		g_backstore2 = XGetImage(g_display, g_backstore, 0, 0, g_width, g_height, AllPlanes, ZPixmap);
 	write(g_bkwh[1], &g_running, 1);
 	g_dirty = 0;
 	g_running = 1;
@@ -4628,11 +4672,18 @@ BackgroundBackStoreShutdown()
 	char ignored;
 	read(g_bkrh[0], &ignored, 1);
 	g_running = 0;
-	XPutImage(g_display, g_wnd, g_gc, g_backstore2, 0, 0, 0, 0, g_width, g_height);
-	XPutImage(g_display, g_backstore3, g_gc, g_backstore2, 0, 0, 0, 0, g_width, g_height);
-	XFree(g_backstore2);
-	g_backstore2 = NULL;
+	if (g_backstore2_shm) {
+		XFlush(g_display);
+		XShmPutImage(g_display, g_wnd, g_gc, g_backstore2, 0, 0, 0, 0, g_width, g_height, 1);
+		XShmPutImage(g_display, g_backstore3, g_gc, g_backstore2, 0, 0, 0, 0, g_width, g_height, 1);
+	} else {
+		XPutImage(g_display, g_wnd, g_gc, g_backstore2, 0, 0, 0, 0, g_width, g_height);
+		XPutImage(g_display, g_backstore3, g_gc, g_backstore2, 0, 0, 0, 0, g_width, g_height);
+		XFree(g_backstore2);
+		g_backstore2 = NULL;
+	}
 #ifdef PROFILE
+	XFlush(g_display);
 	gettimeofday(&measure_stop, NULL);
 #endif
 #ifdef PROFILE
