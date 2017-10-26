@@ -4,6 +4,7 @@
    Copyright (C) Matthew Chapman <matthewc.unsw.edu.au> 1999-2008
    Copyright 2003-2011 Peter Astrand <astrand@cendio.se> for Cendio AB
    Copyright 2011-2017 Henrik Andersson <hean01@cendio.se> for Cendio AB
+   Copyright 2017 Karl Mikaelsson <derfian@cendio.se> for Cendio AB
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -34,7 +35,6 @@ extern uint16 g_mcs_userid;
 extern char *g_username;
 extern char g_password[64];
 extern char g_codepage[16];
-extern RD_BOOL g_bitmap_compression;
 extern RD_BOOL g_orders;
 extern RD_BOOL g_encryption;
 extern RD_BOOL g_desktop_save;
@@ -80,6 +80,8 @@ extern RD_BOOL g_has_reconnect_random;
 extern uint8 g_client_random[SEC_RANDOM_SIZE];
 static uint32 g_packetno;
 
+static void rdp_out_unistr(STREAM s, char *string, int len);
+
 /* Receive an RDP packet */
 static STREAM
 rdp_recv(uint8 * type)
@@ -101,8 +103,8 @@ rdp_recv(uint8 * type)
 		}
 		else if (rdpver != 3)
 		{
-			/* rdp5_process should move g_next_packet ok */
-			rdp5_process(rdp_s);
+			/* process_ts_fp_updates moves g_next_packet */
+			process_ts_fp_updates(rdp_s);
 			*type = 0;
 			return rdp_s;
 		}
@@ -171,9 +173,15 @@ rdp_send_data(STREAM s, uint8 data_pdu_type)
 /* Output a string in Unicode with mandatory null termination. If
    string is NULL or len is 0, write an unicode null termination to
    stream. */
-void
+static void
 rdp_out_unistr_mandatory_null(STREAM s, char *string, int len)
 {
+	/* LEGACY:
+	 *
+	 *  Do not write new code that uses this function, use the ones defined
+	 *  in stream.h for writing utf16 strings to a stream.
+	 *
+	 */
 	if (string && len > 0)
 		rdp_out_unistr(s, string, len);
 	else
@@ -181,9 +189,15 @@ rdp_out_unistr_mandatory_null(STREAM s, char *string, int len)
 }
 
 /* Output a string in Unicode */
-void
+static void
 rdp_out_unistr(STREAM s, char *string, int len)
 {
+	/* LEGACY:
+	 *
+	 *  Do not write new code that uses this function, use the ones defined
+	 *  in stream.h for writing utf16 strings to a stream.
+	 *
+	 */
 	static iconv_t icv_local_to_utf16;
 	size_t ibl, obl;
 	char *pin, *pout;
@@ -338,8 +352,12 @@ rdp_send_logon_info(uint32 flags, char *domain, char *user,
 
 		if (g_redirect == True && g_redirect_cookie_len > 0)
 		{
+			flags |= RDP_INFO_AUTOLOGON;
 			len_password = g_redirect_cookie_len;
 			len_password -= 2;	/* substract 2 bytes which is added below */
+			logger(Protocol, Debug,
+			       "rdp_send_logon_info(), Using %d bytes redirect cookie as password",
+			       g_redirect_cookie_len);
 		}
 
 		packetlen =
@@ -606,93 +624,112 @@ rdp_send_fonts(uint16 seq)
 	rdp_send_data(s, RDP_DATA_PDU_FONT2);
 }
 
-/* Output general capability set */
+/* Output general capability set (TS_GENERAL_CAPABILITYSET) */
 static void
-rdp_out_general_caps(STREAM s)
+rdp_out_ts_general_capabilityset(STREAM s)
 {
+	uint16 extraFlags = 0;
+	if (g_rdp_version >= RDP_V5)
+	{
+		extraFlags |= NO_BITMAP_COMPRESSION_HDR;
+		extraFlags |= AUTORECONNECT_SUPPORTED;
+		extraFlags |= LONG_CREDENTIALS_SUPPORTED;
+		extraFlags |= FASTPATH_OUTPUT_SUPPORTED;
+	}
+
 	out_uint16_le(s, RDP_CAPSET_GENERAL);
 	out_uint16_le(s, RDP_CAPLEN_GENERAL);
-
-	out_uint16_le(s, 1);	/* OS major type */
-	out_uint16_le(s, 3);	/* OS minor type */
-	out_uint16_le(s, 0x200);	/* Protocol version */
-	out_uint16(s, 0);	/* Pad */
-	out_uint16(s, 0);	/* Compression types */
-	out_uint16_le(s, (g_rdp_version >= RDP_V5) ? 0x40d : 0);
-	/* Pad, according to T.128. 0x40d seems to 
-	   trigger
-	   the server to start sending RDP5 packets. 
-	   However, the value is 0x1d04 with W2KTSK and
-	   NT4MS. Hmm.. Anyway, thankyou, Microsoft,
-	   for sending such information in a padding 
-	   field.. */
-	out_uint16(s, 0);	/* Update capability */
-	out_uint16(s, 0);	/* Remote unshare capability */
-	out_uint16(s, 0);	/* Compression level */
-	out_uint16(s, 0);	/* Pad */
+	out_uint16_le(s, OSMAJORTYPE_WINDOWS);		/* osMajorType */
+	out_uint16_le(s, OSMINORTYPE_WINDOWSNT);	/* osMinorType */
+	out_uint16_le(s, TS_CAPS_PROTOCOLVERSION);	/* protocolVersion (must be TS_CAPS_PROTOCOLVERSION) */
+	out_uint16_le(s, 0);				/* pad2OctetsA */
+	out_uint16_le(s, 0);				/* generalCompressionTypes (must be 0) */
+	out_uint16_le(s, extraFlags);			/* extraFlags */
+	out_uint16_le(s, 0);				/* updateCapabilityFlag (must be 0) */
+	out_uint16_le(s, 0);				/* remoteUnshareFlag (must be 0) */
+	out_uint16_le(s, 0);				/* generalCompressionLevel (must be 0) */
+	out_uint8(s, 0);				/* refreshRectSupport */
+	out_uint8(s, 0);				/* suppressOutputSupport */
 }
 
 /* Output bitmap capability set */
 static void
-rdp_out_bitmap_caps(STREAM s)
+rdp_out_ts_bitmap_capabilityset(STREAM s)
 {
 	out_uint16_le(s, RDP_CAPSET_BITMAP);
 	out_uint16_le(s, RDP_CAPLEN_BITMAP);
-
-	out_uint16_le(s, g_server_depth);	/* Preferred colour depth */
-	out_uint16_le(s, 1);	/* Receive 1 BPP */
-	out_uint16_le(s, 1);	/* Receive 4 BPP */
-	out_uint16_le(s, 1);	/* Receive 8 BPP */
-	out_uint16_le(s, 800);	/* Desktop width */
-	out_uint16_le(s, 600);	/* Desktop height */
-	out_uint16(s, 0);	/* Pad */
-	out_uint16(s, 1);	/* Allow resize */
-	out_uint16_le(s, g_bitmap_compression ? 1 : 0);	/* Support compression */
-	out_uint16(s, 0);	/* Unknown */
-	out_uint16_le(s, 1);	/* Unknown */
-	out_uint16(s, 0);	/* Pad */
+	out_uint16_le(s, g_server_depth);	/* preferredBitsPerPixel */
+	out_uint16_le(s, 1);			/* receive1BitPerPixel (ignored, should be 1) */
+	out_uint16_le(s, 1);			/* receive4BitPerPixel (ignored, should be 1) */
+	out_uint16_le(s, 1);			/* receive8BitPerPixel (ignored, should be 1) */
+	out_uint16_le(s, 800);			/* desktopWidth */
+	out_uint16_le(s, 600);			/* desktopHeight */
+	out_uint16_le(s, 0);			/* pad2Octets */
+	out_uint16_le(s, 1);			/* desktopResizeFlag */
+	out_uint16_le(s, 1);			/* bitmapCompressionFlag (must be 1) */
+	out_uint8(s, 0);			/* highColorFlags (ignored, should be 0) */
+	out_uint8(s, 0);			/* drawingFlags */
+	out_uint16_le(s, 1);			/* multipleRectangleSupport (must be 1) */
+	out_uint16_le(s, 0);			/* pad2OctetsB */
 }
 
 /* Output order capability set */
 static void
-rdp_out_order_caps(STREAM s)
+rdp_out_ts_order_capabilityset(STREAM s)
 {
 	uint8 order_caps[32];
+	uint16 orderflags = 0;
+	uint32 cachesize = 0;
+
+	orderflags |= (NEGOTIATEORDERSUPPORT | ZEROBOUNDSDELTASSUPPORT); /* mandatory flags */
+	orderflags |= COLORINDEXSUPPORT;
 
 	memset(order_caps, 0, 32);
-	order_caps[0] = 1;	/* dest blt */
-	order_caps[1] = 1;	/* pat blt */
-	order_caps[2] = 1;	/* screen blt */
-	order_caps[3] = (g_bitmap_cache ? 1 : 0);	/* memblt */
-	order_caps[4] = 0;	/* triblt */
-	order_caps[8] = 1;	/* line */
-	order_caps[9] = 1;	/* line */
-	order_caps[10] = 1;	/* rect */
-	order_caps[11] = (g_desktop_save ? 1 : 0);	/* desksave */
-	order_caps[13] = 1;	/* memblt */
-	order_caps[14] = 1;	/* triblt */
-	order_caps[20] = (g_polygon_ellipse_orders ? 1 : 0);	/* polygon */
-	order_caps[21] = (g_polygon_ellipse_orders ? 1 : 0);	/* polygon2 */
-	order_caps[22] = 1;	/* polyline */
-	order_caps[25] = (g_polygon_ellipse_orders ? 1 : 0);	/* ellipse */
-	order_caps[26] = (g_polygon_ellipse_orders ? 1 : 0);	/* ellipse2 */
-	order_caps[27] = 1;	/* text2 */
+
+	order_caps[TS_NEG_DSTBLT_INDEX] = 1;
+	order_caps[TS_NEG_PATBLT_INDEX] = 1;
+	order_caps[TS_NEG_SCRBLT_INDEX] = 1;
+	order_caps[TS_NEG_LINETO_INDEX] = 1;
+	order_caps[TS_NEG_MULTI_DRAWNINEGRID_INDEX] = 1;
+	order_caps[TS_NEG_POLYLINE_INDEX] = 1;
+	order_caps[TS_NEG_INDEX_INDEX] = 1;
+
+	if (g_bitmap_cache)
+		order_caps[TS_NEG_MEMBLT_INDEX] = 1;
+
+	if (g_desktop_save)
+	{
+		cachesize = 230400;
+		order_caps[TS_NEG_SAVEBITMAP_INDEX] = 1;
+	}
+
+	if (g_polygon_ellipse_orders)
+	{
+		order_caps[TS_NEG_POLYGON_SC_INDEX] = 1;
+		order_caps[TS_NEG_POLYGON_CB_INDEX] = 1;
+		order_caps[TS_NEG_ELLIPSE_SC_INDEX] = 1;
+		order_caps[TS_NEG_ELLIPSE_CB_INDEX] = 1;
+	}
+
 	out_uint16_le(s, RDP_CAPSET_ORDER);
 	out_uint16_le(s, RDP_CAPLEN_ORDER);
-
-	out_uint8s(s, 20);	/* Terminal desc, pad */
-	out_uint16_le(s, 1);	/* Cache X granularity */
-	out_uint16_le(s, 20);	/* Cache Y granularity */
-	out_uint16(s, 0);	/* Pad */
-	out_uint16_le(s, 1);	/* Max order level */
-	out_uint16_le(s, 0x147);	/* Number of fonts */
-	out_uint16_le(s, 0x2a);	/* Capability flags */
-	out_uint8p(s, order_caps, 32);	/* Orders supported */
-	out_uint16_le(s, 0x6a1);	/* Text capability flags */
-	out_uint8s(s, 6);	/* Pad */
-	out_uint32_le(s, g_desktop_save == False ? 0 : 0x38400);	/* Desktop cache size */
-	out_uint32(s, 0);	/* Unknown */
-	out_uint32_le(s, 0x4e4);	/* Unknown */
+	out_uint8s(s, 16);		/* terminalDescriptor (ignored, should be 0) */
+	out_uint8s(s, 4);		/* pad4OctetsA */
+	out_uint16_le(s, 1);		/* desktopSaveXGranularity (ignored, assumed to be 1) */
+	out_uint16_le(s, 20);		/* desktopSaveYGranularity (ignored, assumed to be 20) */
+	out_uint16_le(s, 0);		/* Pad */
+	out_uint16_le(s, 1);		/* maximumOrderLevel (ignored, should be 1) */
+	out_uint16_le(s, 0);		/* numberFonts (ignored, should be 0) */
+	out_uint16_le(s, orderflags);	/* orderFlags */
+	out_uint8p(s, order_caps, 32);	/* orderSupport */
+	out_uint16_le(s, 0);		/* textFlags (ignored) */
+	out_uint16_le(s, 0);    	/* orderSupportExFlags */
+	out_uint32_le(s, 0);		/* pad4OctetsB */
+	out_uint32_le(s, cachesize);	/* desktopSaveSize */
+	out_uint16_le(s, 0);		/* pad2OctetsC */
+	out_uint16_le(s, 0);		/* pad2OctetsD */
+	out_uint16_le(s, 1252);		/* textANSICodePage */
+	out_uint16_le(s, 0);		/* pad2OctetsE */
 }
 
 /* Output bitmap cache capability set */
@@ -818,41 +855,100 @@ rdp_out_brushcache_caps(STREAM s)
 	out_uint32_le(s, 1);	/* cache type */
 }
 
-static uint8 caps_0x0d[] = {
-	0x01, 0x00, 0x00, 0x00, 0x09, 0x04, 0x00, 0x00,
-	0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00
-};
-
-static uint8 caps_0x0c[] = { 0x01, 0x00, 0x00, 0x00 };
-
-static uint8 caps_0x0e[] = { 0x01, 0x00, 0x00, 0x00 };
-
-static uint8 caps_0x10[] = {
-	0xFE, 0x00, 0x04, 0x00, 0xFE, 0x00, 0x04, 0x00,
-	0xFE, 0x00, 0x08, 0x00, 0xFE, 0x00, 0x08, 0x00,
-	0xFE, 0x00, 0x10, 0x00, 0xFE, 0x00, 0x20, 0x00,
-	0xFE, 0x00, 0x40, 0x00, 0xFE, 0x00, 0x80, 0x00,
-	0xFE, 0x00, 0x00, 0x01, 0x40, 0x00, 0x00, 0x08,
-	0x00, 0x01, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00
-};
-
-/* Output unknown capability sets */
+/* Output Input Capability Set */
 static void
-rdp_out_unknown_caps(STREAM s, uint16 id, uint16 length, uint8 * caps)
+rdp_out_ts_input_capabilityset(STREAM s)
 {
-	out_uint16_le(s, id);
-	out_uint16_le(s, length);
+	uint16 inputflags = 0;
+	inputflags |= INPUT_FLAG_SCANCODES;
 
-	out_uint8p(s, caps, length - 4);
+	out_uint16_le(s, RDP_CAPSET_INPUT);
+	out_uint16_le(s, RDP_CAPLEN_INPUT);
+
+	out_uint16_le(s, inputflags);		/* inputFlags */
+	out_uint16_le(s, 0);			/* pad2OctetsA */
+	out_uint32_le(s, 0x409);		/* keyboardLayout */
+	out_uint32_le(s, 0x4);			/* keyboardType */
+	out_uint32_le(s, 0);			/* keyboardSubtype */
+	out_uint32_le(s, 0xC);			/* keyboardFunctionKey */
+	out_utf16s_padded(s, "", 64, 0);	/* imeFileName */
+}
+
+/* Output Sound Capability Set */
+static void
+rdp_out_ts_sound_capabilityset(STREAM s)
+{
+	uint16 soundflags = SOUND_BEEPS_FLAG;
+
+	out_uint16_le(s, RDP_CAPSET_SOUND);
+	out_uint16_le(s, RDP_CAPLEN_SOUND);
+
+	out_uint16_le(s, soundflags);	/* soundFlags */
+	out_uint16_le(s, 0);		/* pad2OctetsA */
+}
+
+/* Output Font Capability Set */
+static void
+rdp_out_ts_font_capabilityset(STREAM s)
+{
+	uint16 flags = FONTSUPPORT_FONTLIST;
+
+	out_uint16_le(s, RDP_CAPSET_FONT);
+	out_uint16_le(s, RDP_CAPLEN_FONT);
+
+	out_uint16_le(s, flags);	/* fontSupportFlags */
+	out_uint16_le(s, 0);		/* pad2octets */
+}
+
+static void
+rdp_out_ts_cache_definition(STREAM s, uint16 entries, uint16 maxcellsize)
+{
+	out_uint16_le(s, entries);
+	out_uint16_le(s, maxcellsize);
+}
+
+/* Output Glyph Cache Capability Set */
+static void
+rdp_out_ts_glyphcache_capabilityset(STREAM s)
+{
+	uint16 supportlvl = GLYPH_SUPPORT_FULL;
+	uint32 fragcache = 0x01000100;
+	out_uint16_le(s, RDP_CAPSET_GLYPHCACHE);
+	out_uint16_le(s, RDP_CAPLEN_GLYPHCACHE);
+
+	/* GlyphCache - 10 TS_CACHE_DEFINITION structures */
+	rdp_out_ts_cache_definition(s, 254, 4);
+	rdp_out_ts_cache_definition(s, 254, 4);
+	rdp_out_ts_cache_definition(s, 254, 8);
+	rdp_out_ts_cache_definition(s, 254, 8);
+	rdp_out_ts_cache_definition(s, 254, 16);
+	rdp_out_ts_cache_definition(s, 254, 32);
+	rdp_out_ts_cache_definition(s, 254, 64);
+	rdp_out_ts_cache_definition(s, 254, 128);
+	rdp_out_ts_cache_definition(s, 254, 256);
+	rdp_out_ts_cache_definition(s, 64, 2048);
+
+	out_uint32_le(s, fragcache);	/* FragCache */
+	out_uint16_le(s, supportlvl);	/* GlyphSupportLevel */
+	out_uint16_le(s, 0);		/* pad2octets */
+}
+
+static void
+rdp_out_ts_multifragmentupdate_capabilityset(STREAM s)
+{
+	out_uint16_le(s, RDP_CAPSET_MULTIFRAGMENTUPDATE);
+	out_uint16_le(s, RDP_CAPLEN_MULTIFRAGMENTUPDATE);
+	out_uint32_le(s, RDESKTOP_FASTPATH_MULTIFRAGMENT_MAX_SIZE);	/* MaxRequestSize */
+}
+
+static void
+rdp_out_ts_large_pointer_capabilityset(STREAM s)
+{
+	uint16 flags = LARGE_POINTER_FLAG_96x96;
+
+	out_uint16_le(s, RDP_CAPSET_LARGE_POINTER);
+	out_uint16_le(s, RDP_CAPLEN_LARGE_POINTER);
+	out_uint16_le(s, flags);	/* largePointerSupportFlags */
 }
 
 #define RDP5_FLAG 0x0030
@@ -863,11 +959,20 @@ rdp_send_confirm_active(void)
 	STREAM s;
 	uint32 sec_flags = g_encryption ? (RDP5_FLAG | SEC_ENCRYPT) : RDP5_FLAG;
 	uint16 caplen =
-		RDP_CAPLEN_GENERAL + RDP_CAPLEN_BITMAP + RDP_CAPLEN_ORDER +
+		RDP_CAPLEN_GENERAL +
+		RDP_CAPLEN_BITMAP +
+		RDP_CAPLEN_ORDER +
 		RDP_CAPLEN_COLCACHE +
-		RDP_CAPLEN_ACTIVATE + RDP_CAPLEN_CONTROL +
+		RDP_CAPLEN_ACTIVATE +
+		RDP_CAPLEN_CONTROL +
 		RDP_CAPLEN_SHARE +
-		RDP_CAPLEN_BRUSHCACHE + 0x58 + 0x08 + 0x08 + 0x34 /* unknown caps */  +
+		RDP_CAPLEN_BRUSHCACHE +
+		RDP_CAPLEN_INPUT +
+		RDP_CAPLEN_FONT +
+		RDP_CAPLEN_SOUND +
+		RDP_CAPLEN_GLYPHCACHE +
+		RDP_CAPLEN_MULTIFRAGMENTUPDATE +
+		RDP_CAPLEN_LARGE_POINTER +
 		4 /* w2k fix, sessionid */ ;
 
 	if (g_rdp_version >= RDP_V5)
@@ -893,12 +998,12 @@ rdp_send_confirm_active(void)
 	out_uint16_le(s, caplen);
 
 	out_uint8p(s, RDP_SOURCE, sizeof(RDP_SOURCE));
-	out_uint16_le(s, 0xe);	/* num_caps */
+	out_uint16_le(s, 16);	/* num_caps */
 	out_uint8s(s, 2);	/* pad */
 
-	rdp_out_general_caps(s);
-	rdp_out_bitmap_caps(s);
-	rdp_out_order_caps(s);
+	rdp_out_ts_general_capabilityset(s);
+	rdp_out_ts_bitmap_capabilityset(s);
+	rdp_out_ts_order_capabilityset(s);
 	if (g_rdp_version >= RDP_V5)
 	{
 		rdp_out_bmpcache2_caps(s);
@@ -915,10 +1020,12 @@ rdp_send_confirm_active(void)
 	rdp_out_share_caps(s);
 	rdp_out_brushcache_caps(s);
 
-	rdp_out_unknown_caps(s, 0x0d, 0x58, caps_0x0d);	/* CAPSTYPE_INPUT */
-	rdp_out_unknown_caps(s, 0x0c, 0x08, caps_0x0c);	/* CAPSTYPE_SOUND */
-	rdp_out_unknown_caps(s, 0x0e, 0x08, caps_0x0e);	/* CAPSTYPE_FONT */
-	rdp_out_unknown_caps(s, 0x10, 0x34, caps_0x10);	/* CAPSTYPE_GLYPHCACHE */
+	rdp_out_ts_input_capabilityset(s);
+	rdp_out_ts_sound_capabilityset(s);
+	rdp_out_ts_font_capabilityset(s);
+	rdp_out_ts_glyphcache_capabilityset(s);
+	rdp_out_ts_multifragmentupdate_capabilityset(s);
+	rdp_out_ts_large_pointer_capabilityset(s);
 
 	s_mark_end(s);
 	sec_send(s, sec_flags);
@@ -1061,6 +1168,7 @@ process_demand_active(STREAM s)
 static void
 process_colour_pointer_common(STREAM s, int bpp)
 {
+	extern RD_BOOL g_local_cursor;
 	uint16 width, height, cache_idx, masklen, datalen;
 	uint16 x, y;
 	uint8 *mask;
@@ -1076,15 +1184,15 @@ process_colour_pointer_common(STREAM s, int bpp)
 	in_uint16_le(s, datalen);
 	in_uint8p(s, data, datalen);
 	in_uint8p(s, mask, masklen);
-	if ((width != 32) || (height != 32))
-	{
-		logger(Protocol, Warning, "process_colour_pointer_common(), width %d height %d",
-		       width, height);
-	}
+
+	logger(Protocol, Debug,
+	       "process_colour_pointer_common(), new pointer %d with width %d and height %d",
+	       cache_idx, width, height);
 
 	/* keep hotspot within cursor bounding box */
 	x = MIN(x, width - 1);
 	y = MIN(y, height - 1);
+	if (g_local_cursor) return ; /* don't bother creating a cursor we won't use */
 	cursor = ui_create_cursor(x, y, width, height, mask, data, bpp);
 	ui_set_cursor(cursor);
 	cache_put_cursor(cache_idx, cursor);
@@ -1121,19 +1229,28 @@ process_cached_pointer_pdu(STREAM s)
 void
 process_system_pointer_pdu(STREAM s)
 {
-	uint16 system_pointer_type;
+	uint32 system_pointer_type;
+	in_uint32_le(s, system_pointer_type);
 
-	in_uint16_le(s, system_pointer_type);
-	switch (system_pointer_type)
+	set_system_pointer(system_pointer_type);
+}
+
+/* Set a given system pointer */
+void
+set_system_pointer(uint32 ptr)
+{
+	switch (ptr)
 	{
-		case RDP_NULL_POINTER:
+		case SYSPTR_NULL:
 			ui_set_null_cursor();
 			break;
-
+		case SYSPTR_DEFAULT:
+			ui_set_standard_cursor();
+			break;
 		default:
 			logger(Protocol, Warning,
-			       "process_system_pointer_pdu(), unhandled pointer type 0x%x",
-			       system_pointer_type);
+			       "set_system_pointer(), unhandled pointer type 0x%x",
+			       ptr);
 	}
 }
 
@@ -1517,7 +1634,7 @@ process_redirect_pdu(STREAM s, RD_BOOL enhanced_redirect /*, uint32 * ext_disc_r
 	/* read connection flags */
 	in_uint32_le(s, g_redirect_flags);
 
-	if (g_redirect_flags & PDU_REDIRECT_HAS_IP)
+	if (g_redirect_flags & LB_TARGET_NET_ADDRESS)
 	{
 		/* read length of ip string */
 		in_uint32_le(s, len);
@@ -1526,7 +1643,7 @@ process_redirect_pdu(STREAM s, RD_BOOL enhanced_redirect /*, uint32 * ext_disc_r
 		rdp_in_unistr(s, len, &g_redirect_server, &g_redirect_server_len);
 	}
 
-	if (g_redirect_flags & PDU_REDIRECT_HAS_LOAD_BALANCE_INFO)
+	if (g_redirect_flags & LB_LOAD_BALANCE_INFO)
 	{
 		/* read length of load balance info blob */
 		in_uint32_le(s, g_redirect_lb_info_len);
@@ -1541,7 +1658,7 @@ process_redirect_pdu(STREAM s, RD_BOOL enhanced_redirect /*, uint32 * ext_disc_r
 		in_uint8p(s, g_redirect_lb_info, g_redirect_lb_info_len);
 	}
 
-	if (g_redirect_flags & PDU_REDIRECT_HAS_USERNAME)
+	if (g_redirect_flags & LB_USERNAME)
 	{
 		/* read length of username string */
 		in_uint32_le(s, len);
@@ -1550,7 +1667,7 @@ process_redirect_pdu(STREAM s, RD_BOOL enhanced_redirect /*, uint32 * ext_disc_r
 		rdp_in_unistr(s, len, &g_redirect_username, &g_redirect_username_len);
 	}
 
-	if (g_redirect_flags & PDU_REDIRECT_HAS_DOMAIN)
+	if (g_redirect_flags & LB_DOMAIN)
 	{
 		/* read length of domain string */
 		in_uint32_le(s, len);
@@ -1559,7 +1676,7 @@ process_redirect_pdu(STREAM s, RD_BOOL enhanced_redirect /*, uint32 * ext_disc_r
 		rdp_in_unistr(s, len, &g_redirect_domain, &g_redirect_domain_len);
 	}
 
-	if (g_redirect_flags & PDU_REDIRECT_HAS_PASSWORD)
+	if (g_redirect_flags & LB_PASSWORD)
 	{
 		/* the information in this blob is either a password or a cookie that
 		   should be passed though as blob and not parsed as a unicode string */
@@ -1575,28 +1692,31 @@ process_redirect_pdu(STREAM s, RD_BOOL enhanced_redirect /*, uint32 * ext_disc_r
 
 		/* read cookie as is */
 		in_uint8p(s, g_redirect_cookie, g_redirect_cookie_len);
+
+		logger(Protocol, Debug, "process_redirect_pdu(), Read %d bytes redirection cookie",
+		       g_redirect_cookie_len);
 	}
 
-	if (g_redirect_flags & PDU_REDIRECT_DONT_STORE_USERNAME)
+	if (g_redirect_flags & LB_DONTSTOREUSERNAME)
 	{
 		logger(Protocol, Warning,
-		       "process_redirect_pdu(), unhandled PDU_REDIRECT_DONT_STORE_USERNAME set");
+		       "process_redirect_pdu(), unhandled LB_DONTSTOREUSERNAME set");
 	}
 
-	if (g_redirect_flags & PDU_REDIRECT_USE_SMARTCARD)
+	if (g_redirect_flags & LB_SMARTCARD_LOGON)
 	{
 		logger(Protocol, Warning,
-		       "process_redirect_pdu(), unhandled PDU_REDIRECT_USE_SMARTCARD set");
+		       "process_redirect_pdu(), unhandled LB_SMARTCARD_LOGON set");
 	}
 
-	if (g_redirect_flags & PDU_REDIRECT_INFORMATIONAL)
+	if (g_redirect_flags & LB_NOREDIRECT)
 	{
 		/* By spec this is only for information and doesn't mean that an actual
 		   redirect should be performed. How it should be used is not mentioned. */
 		g_redirect = False;
 	}
 
-	if (g_redirect_flags & PDU_REDIRECT_HAS_TARGET_FQDN)
+	if (g_redirect_flags & LB_TARGET_FQDN)
 	{
 		in_uint32_le(s, len);
 
@@ -1611,16 +1731,42 @@ process_redirect_pdu(STREAM s, RD_BOOL enhanced_redirect /*, uint32 * ext_disc_r
 		rdp_in_unistr(s, len, &g_redirect_server, &g_redirect_server_len);
 	}
 
-	if (g_redirect_flags & PDU_REDIRECT_HAS_TARGET_NETBIOS)
+	if (g_redirect_flags & LB_TARGET_NETBIOS)
 	{
-		logger(Protocol, Warning,
-		       "process_redirect_pdu(), unhandled PDU_REDIRECT_HAS_TARGET_NETBIOS set");
+		logger(Protocol, Warning, "process_redirect_pdu(), unhandled LB_TARGET_NETBIOS");
 	}
 
-	if (g_redirect_flags & PDU_REDIRECT_HAS_TARGET_IP_ARRAY)
+	if (g_redirect_flags & LB_TARGET_NET_ADDRESSES)
 	{
 		logger(Protocol, Warning,
-		       "process_redirect_pdu(), unhandled  PDU_REDIRECT_HAS_TARGET_IP_ARRAY set");
+		       "process_redirect_pdu(), unhandled LB_TARGET_NET_ADDRESSES");
+	}
+
+	if (g_redirect_flags & LB_CLIENT_TSV_URL)
+	{
+		logger(Protocol, Warning, "process_redirect_pdu(), unhandled LB_CLIENT_TSV_URL");
+	}
+
+	if (g_redirect_flags & LB_SERVER_TSV_CAPABLE)
+	{
+		logger(Protocol, Warning, "process_redirect_pdu(), unhandled LB_SERVER_TSV_URL");
+	}
+
+	if (g_redirect_flags & LB_PASSWORD_IS_PK_ENCRYPTED)
+	{
+		logger(Protocol, Warning,
+		       "process_redirect_pdu(), unhandled LB_PASSWORD_IS_PK_ENCRYPTED ");
+	}
+
+	if (g_redirect_flags & LB_REDIRECTION_GUID)
+	{
+		logger(Protocol, Warning, "process_redirect_pdu(), unhandled LB_REDIRECTION_GUID ");
+	}
+
+	if (g_redirect_flags & LB_TARGET_CERTIFICATE)
+	{
+		logger(Protocol, Warning,
+		       "process_redirect_pdu(), unhandled LB_TARGET_CERTIFICATE");
 	}
 
 	return True;

@@ -35,6 +35,7 @@
 #include <openssl/err.h>
 
 #include "rdesktop.h"
+#include "ssl.h"
 
 #ifdef _WIN32
 #define socklen_t int
@@ -100,16 +101,9 @@ tcp_init(uint32 maxlen)
 	scard_lock(SCARD_LOCK_TCP);
 #endif
 	result = &g_out[cur_stream_id];
+	s_realloc(result, maxlen);
+	s_reset(result);
 	cur_stream_id = (cur_stream_id + 1) % STREAM_COUNT;
-
-	if (maxlen > result->size)
-	{
-		result->data = (uint8 *) xrealloc(result->data, maxlen);
-		result->size = maxlen;
-	}
-
-	result->p = result->data;
-	result->end = result->data + result->size;
 #ifdef WITH_SCARD
 	scard_unlock(SCARD_LOCK_TCP);
 #endif
@@ -248,7 +242,7 @@ tcp_recv(STREAM s, uint32 length)
 					return NULL;
 				}
 
-				ERR_print_errors_fp(stdout);
+				rdssl_log_ssl_errors("tcp_recv()");
 				g_network_error = True;
 				return NULL;
 			}
@@ -356,7 +350,7 @@ tcp_tls_connect(void)
 
 	if (err < 0)
 	{
-		ERR_print_errors_fp(stdout);
+		rdssl_log_ssl_errors("tcp_tls_connect()");
 		goto fail;
 	}
 
@@ -584,32 +578,12 @@ tcp_reset_state(void)
 	int i;
 
 	/* Clear the incoming stream */
-	if (g_in.data != NULL)
-		xfree(g_in.data);
-	g_in.p = NULL;
-	g_in.end = NULL;
-	g_in.data = NULL;
-	g_in.size = 0;
-	g_in.iso_hdr = NULL;
-	g_in.mcs_hdr = NULL;
-	g_in.sec_hdr = NULL;
-	g_in.rdp_hdr = NULL;
-	g_in.channel_hdr = NULL;
+	s_reset(&g_in);
 
 	/* Clear the outgoing stream(s) */
 	for (i = 0; i < STREAM_COUNT; i++)
 	{
-		if (g_out[i].data != NULL)
-			xfree(g_out[i].data);
-		g_out[i].p = NULL;
-		g_out[i].end = NULL;
-		g_out[i].data = NULL;
-		g_out[i].size = 0;
-		g_out[i].iso_hdr = NULL;
-		g_out[i].mcs_hdr = NULL;
-		g_out[i].sec_hdr = NULL;
-		g_out[i].rdp_hdr = NULL;
-		g_out[i].channel_hdr = NULL;
+		s_reset(&g_out[i]);
 	}
 }
 

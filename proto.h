@@ -24,6 +24,7 @@
 extern "C" {
 #endif
 /* *INDENT-ON* */
+#define UNUSED(param) ((void)param)
 /* bitmap.c */
 RD_BOOL bitmap_decompress(uint8 * output, int width, int height, uint8 * input, int size, int Bpp);
 /* cache.c */
@@ -144,9 +145,8 @@ int rd_write_file(int fd, void *ptr, int len);
 int rd_lseek_file(int fd, int offset);
 RD_BOOL rd_lock_file(int fd, int start, int len);
 /* rdp5.c */
-void rdp5_process(STREAM s);
+void process_ts_fp_updates(STREAM s);
 /* rdp.c */
-void rdp_out_unistr(STREAM s, char *string, int len);
 void rdp_in_unistr(STREAM s, int in_len, char **string, uint32 * str_size);
 void rdp_send_input(uint32 time, uint16 message_type, uint16 device_flags, uint16 param1,
 		    uint16 param2);
@@ -155,6 +155,7 @@ void process_colour_pointer_pdu(STREAM s);
 void process_new_pointer_pdu(STREAM s);
 void process_cached_pointer_pdu(STREAM s);
 void process_system_pointer_pdu(STREAM s);
+void set_system_pointer(uint32 ptr);
 void process_bitmap_updates(STREAM s);
 void process_palette(STREAM s);
 void process_disconnect_pdu(STREAM s, uint32 * ext_disc_reason);
@@ -244,7 +245,7 @@ RD_BOOL handle_special_keys(uint32 keysym, unsigned int state, uint32 ev_time, R
 key_translation xkeymap_translate_key(uint32 keysym, unsigned int keycode, unsigned int state);
 void xkeymap_send_keys(uint32 keysym, unsigned int keycode, unsigned int state, uint32 ev_time,
 		       RD_BOOL pressed, uint8 nesting);
-uint16 xkeymap_translate_button(unsigned int button);
+uint16 xkeymap_translate_button(unsigned int button, uint16 * input_type);
 char *get_ksname(uint32 keysym);
 void save_remote_modifiers(uint8 scancode);
 void restore_remote_modifiers(uint32 ev_time, uint8 scancode);
@@ -275,6 +276,7 @@ RD_HCURSOR ui_create_cursor(unsigned int x, unsigned int y, int width, int heigh
 void ui_set_cursor(RD_HCURSOR cursor);
 void ui_destroy_cursor(RD_HCURSOR cursor);
 void ui_set_null_cursor(void);
+void ui_set_standard_cursor(void);
 RD_HCOLOURMAP ui_create_colourmap(COLOURMAP * colours);
 void ui_destroy_colourmap(RD_HCOLOURMAP map);
 void ui_set_colourmap(RD_HCOLOURMAP map);

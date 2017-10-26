@@ -27,6 +27,7 @@
 #include <X11/extensions/XShm.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <assert.h>
 #include <unistd.h>
 #include <sys/time.h>
 #include <time.h>
@@ -35,13 +36,19 @@
 #include <pthread.h>
 #include "rdesktop.h"
 #include "xproto.h"
+#include <X11/Xcursor/Xcursor.h>
 #ifdef HAVE_XRANDR
 #include <X11/extensions/Xrandr.h>
 #endif
 
-/*#define PROFILE*/
+/*#define PROFILE_SURGE */
 
 extern void SurgeAdjustImage(XImage *image);
+#ifdef __APPLE__
+#include <sys/param.h>
+#define HOST_NAME_MAX MAXHOSTNAMELEN
+#endif
+
 extern int g_sizeopt;
 extern int g_width;
 extern int g_height;
@@ -586,6 +593,7 @@ typedef struct _sw_configurenotify_context
 static Bool
 sw_configurenotify_p(Display * display, XEvent * xevent, XPointer arg)
 {
+	UNUSED(display);
 	sw_configurenotify_context *context = (sw_configurenotify_context *) arg;
 	if (xevent->xany.type == ConfigureNotify
 	    && xevent->xconfigure.window == context->window
@@ -675,7 +683,7 @@ sw_window_is_behind(Window wnd, Window behind)
 	Window dummy1, dummy2;
 	Window *child_list;
 	unsigned int num_children;
-	unsigned int i;
+	int i;
 	RD_BOOL found_behind = False;
 	RD_BOOL found_wnd = False;
 
@@ -1578,9 +1586,10 @@ static void
 xwin_refresh_pointer_map(void)
 {
 	unsigned char phys_to_log_map[sizeof(g_pointer_log_to_phys_map)];
-	int i, pointer_buttons;
+	int i;
+	unsigned int pointer_buttons;
 
-	pointer_buttons = XGetPointerMapping(g_display, phys_to_log_map, sizeof(phys_to_log_map));
+	pointer_buttons = (unsigned int)XGetPointerMapping(g_display, phys_to_log_map, sizeof(phys_to_log_map));
 	if (pointer_buttons > sizeof(phys_to_log_map))
 		pointer_buttons = sizeof(phys_to_log_map);
 
@@ -2283,7 +2292,6 @@ ui_resize_window()
 		g_backstore = bs;
 	}
 
-	ui_reset_clip();
 }
 
 RD_BOOL
@@ -2351,7 +2359,7 @@ xwin_toggle_fullscreen(void)
 static void
 handle_button_event(XEvent xevent, RD_BOOL down)
 {
-	uint16 button, flags = 0;
+	uint16 button, input_type, flags = 0;
 	g_last_gesturetime = xevent.xbutton.time;
 	/* Reverse the pointer button mapping, e.g. in the case of
 	   "left-handed mouse mode"; the RDP session expects to
@@ -2359,7 +2367,7 @@ handle_button_event(XEvent xevent, RD_BOOL down)
 	   logical button behavior depends on the remote desktop's own
 	   mouse settings */
 	xevent.xbutton.button = g_pointer_log_to_phys_map[xevent.xbutton.button - 1];
-	button = xkeymap_translate_button(xevent.xbutton.button);
+	button = xkeymap_translate_button(xevent.xbutton.button, &input_type);
 	if (button == 0)
 		return;
 
@@ -2395,7 +2403,7 @@ handle_button_event(XEvent xevent, RD_BOOL down)
 			{
 				/* Release the mouse button outside the minimize button, to prevent the
 				   actual minimazation to happen */
-				rdp_send_input(time(NULL), RDP_INPUT_MOUSE, button, 1, 1);
+				rdp_send_input(time(NULL), input_type, button, 1, 1);
 				XIconifyWindow(g_display, g_wnd, DefaultScreen(g_display));
 				return;
 			}
@@ -2432,13 +2440,13 @@ handle_button_event(XEvent xevent, RD_BOOL down)
 
 	if (xevent.xmotion.window == g_wnd)
 	{
-		rdp_send_input(time(NULL), RDP_INPUT_MOUSE,
+		rdp_send_input(time(NULL), input_type,
 			       flags | button, xevent.xbutton.x, xevent.xbutton.y);
 	}
 	else
 	{
 		/* SeamlessRDP */
-		rdp_send_input(time(NULL), RDP_INPUT_MOUSE,
+		rdp_send_input(time(NULL), input_type,
 			       flags | button, xevent.xbutton.x_root, xevent.xbutton.y_root);
 	}
 }
@@ -2487,7 +2495,7 @@ xwin_process_events(void)
 			case ClientMessage:
 				if (xevent.xclient.message_type == g_protocol_atom)
 				{
-					if (xevent.xclient.data.l[0] == g_kill_atom)
+					if (xevent.xclient.data.l[0] == (long)g_kill_atom)
 					{
 						/* the window manager told us to quit */
 
@@ -2500,7 +2508,7 @@ xwin_process_events(void)
 						/* send seamless destroy process message */
 						seamless_send_destroy(sw->id);
 					}
-					else if (xevent.xclient.data.l[0] == g_net_wm_ping_atom)
+					else if (xevent.xclient.data.l[0] == (long)g_net_wm_ping_atom)
 					{
 						/* pass ping message further to root window */
 						xevent.xclient.window =
@@ -3006,148 +3014,187 @@ ui_destroy_glyph(RD_HGLYPH glyph)
 	XFreePixmap(g_display, (Pixmap) glyph);
 }
 
-/* convert next pixel to 32 bpp */
-static int
-get_next_xor_pixel(uint8 * xormask, int bpp, int *k)
-{
-	int rv = 0;
-	PixelColour pc;
-	uint8 *s8;
-	uint16 *s16;
+#define GET_BIT(ptr, bit) (*(ptr + bit / 8) & (1 << (7 - (bit % 8))))
 
+static uint32
+get_pixel(uint32 idx, uint8 * andmask, uint8 * xormask, int bpp, uint8 * xor_flag)
+{
+	uint32 offs;
+	uint32 argb;
+	uint8 alpha;
+	uint8 *pxor;
+
+	*xor_flag = 0;
+
+	/* return a red pixel if bpp is not supported to signal failure */
+	argb = 0xffff0000;
 	switch (bpp)
 	{
 		case 1:
-			s8 = xormask + (*k) / 8;
-			rv = (*s8) & (0x80 >> ((*k) % 8));
-			rv = rv ? 0xffffff : 0;
-			(*k) += 1;
+			offs = idx;
+			argb = GET_BIT(xormask, idx);
+			alpha = GET_BIT(andmask, idx) ? 0x00 : 0xff;
+			if (!GET_BIT(andmask, idx) == 0x00 && argb)
+			{
+				// If we have an xor bit is high and
+				// andmask bit is low, we should
+				// render a black pixle due to we can
+				// not xor blit in X11.
+				argb = 0xff000000;
+				*xor_flag = 1;
+			}
+			else
+				argb = (alpha << 24) | (argb ? 0xffffff : 0x000000);
 			break;
-		case 8:
-			s8 = xormask + *k;
-			/* should use colour map */
-			rv = s8[0];
-			rv = rv ? 0xffffff : 0;
-			(*k) += 1;
-			break;
-		case 15:
-			s16 = (uint16 *) xormask;
-			SPLITCOLOUR15(s16[*k], pc);
-			rv = (pc.red << 16) | (pc.green << 8) | pc.blue;
-			(*k) += 1;
-			break;
-		case 16:
-			s16 = (uint16 *) xormask;
-			SPLITCOLOUR16(s16[*k], pc);
-			rv = (pc.red << 16) | (pc.green << 8) | pc.blue;
-			(*k) += 1;
-			break;
+
 		case 24:
-			s8 = xormask + *k;
-			rv = (s8[0] << 16) | (s8[1] << 8) | s8[2];
-			(*k) += 3;
+			offs = idx * 3;
+			pxor = xormask + offs;
+			alpha = GET_BIT(andmask, idx) ? 0x00 : 0xff;
+			argb = (alpha << 24) | (pxor[2] << 16) | (pxor[1] << 8) | pxor[0];
 			break;
+
 		case 32:
-			s8 = xormask + *k;
-			rv = (s8[1] << 16) | (s8[2] << 8) | s8[3];
-			(*k) += 4;
-			break;
-		default:
-			logger(GUI, Warning, "get_next_xor_pixel(), unhandled bpp=%d", bpp);
+			offs = idx * 4;
+			pxor = xormask + offs;
+			argb = (pxor[3] << 24) | (pxor[2] << 16) | (pxor[1] << 8) | pxor[0];
 			break;
 	}
-	return rv;
+
+	return argb;
+}
+
+/* Copies the pixles from src to dest with given color and offset */
+static inline void
+xcursor_stencil(XcursorImage * src, XcursorImage * dst, int dx, int dy, uint32 argb)
+{
+	int x, y, si, di;
+	assert(src->width == dst->width);
+	assert(src->height == dst->height);
+
+	for (y = 0; y < src->height; y++)
+	{
+		for (x = 0; x < src->width; x++)
+		{
+			si = y * src->width + x;
+			if (!src->pixels[si])
+				continue;
+
+			if ((y + dy) < 0 || (y + dy) >= dst->height)
+				continue;
+			if ((x + dx) < 0 || (x + dx) >= dst->width)
+				continue;
+			di = (y + dy) * src->width + (x + dx);
+			dst->pixels[di] = argb;
+		}
+	}
+}
+
+static inline void
+xcursor_merge(XcursorImage * src, XcursorImage * dst)
+{
+	uint32 i;
+	assert(src->width == dst->width);
+	assert(src->height == dst->height);
+	for (i = 0; i < src->width * src->height; i++)
+	{
+		if (!src->pixels[i])
+			continue;
+		dst->pixels[i] = src->pixels[i];
+	}
 }
 
 RD_HCURSOR
-ui_create_cursor(unsigned int x, unsigned int y, int width, int height,
-		 uint8 * andmask, uint8 * xormask, int bpp)
+ui_create_cursor(unsigned int xhot, unsigned int yhot, int width,
+		 int height, uint8 * andmask, uint8 * xormask, int bpp)
 {
-	RD_HGLYPH maskglyph, cursorglyph;
-	XColor bg, fg;
-	Cursor xcursor;
-	uint8 *cursor, *pcursor;
-	uint8 *mask, *pmask;
-	uint8 nextbit;
-	int scanline, offset, delta;
-	int i, j, k;
+	Cursor cursor;
+	XcursorPixel *out;
+	XcursorImage *cimg, *tmp;
+	uint32 x, y, oidx, idx, argb;
+	uint8 outline, xor;
 
-	k = 0;
-	scanline = (width + 7) / 8;
-	offset = scanline * height;
+	logger(GUI, Debug, "ui_create_cursor(): xhot=%d, yhot=%d, width=%d, height=%d, bpp=%d",
+	       xhot, yhot, width, height, bpp);
 
-	cursor = (uint8 *) xmalloc(offset);
-	memset(cursor, 0, offset);
-
-	mask = (uint8 *) xmalloc(offset);
-	memset(mask, 0, offset);
-	if (bpp == 1)
+	if (bpp != 1 && bpp != 24 && bpp != 32)
 	{
-		offset = 0;
-		delta = scanline;
+		logger(GUI, Warning, "ui_create_xcursor_cursor(): Unhandled cursor bit depth %d",
+		       bpp);
+		return g_null_cursor;
 	}
-	else
-	{
-		offset = scanline * height - scanline;
-		delta = -scanline;
-	}
-	/* approximate AND and XOR masks with a monochrome X pointer */
-	for (i = 0; i < height; i++)
-	{
-		pcursor = &cursor[offset];
-		pmask = &mask[offset];
 
-		for (j = 0; j < scanline; j++)
+	cimg = XcursorImageCreate(width, height);
+	if (!cimg)
+	{
+		logger(GUI, Error, "ui_create_xcursor_cursor(): XcursorImageCreate() failed");
+		return g_null_cursor;
+	}
+
+	cimg->xhot = xhot;
+	cimg->yhot = yhot;
+
+	out = cimg->pixels;
+	xor = 0;
+	outline = 0;
+	for (y = 0; y < height; y++)
+	{
+		for (x = 0; x < width; x++)
 		{
-			for (nextbit = 0x80; nextbit != 0; nextbit >>= 1)
+			oidx = y * width + x;
+
+			// Flip cursor on Y axis if color pointer
+			if (bpp != 1)
 			{
-				if (get_next_xor_pixel(xormask, bpp, &k))
-				{
-					*pcursor |= (~(*andmask) & nextbit);
-					*pmask |= nextbit;
-				}
-				else
-				{
-					*pcursor |= ((*andmask) & nextbit);
-					*pmask |= (~(*andmask) & nextbit);
-				}
+				oidx = (height - 1 - y) * width + x;
 			}
 
-			andmask++;
-			pcursor++;
-			pmask++;
+			idx = y * width + x;
+			argb = get_pixel(idx, andmask, xormask, bpp, &xor);
+			out[oidx] = argb;
+			if (xor)
+				outline = 1;
 		}
-		offset += delta;
 	}
 
-	fg.red = fg.blue = fg.green = 0xffff;
-	bg.red = bg.blue = bg.green = 0x0000;
-	fg.flags = bg.flags = DoRed | DoBlue | DoGreen;
 
-	cursorglyph = ui_create_glyph(width, height, cursor);
-	maskglyph = ui_create_glyph(width, height, mask);
+	// Render a white outline of cursor shape when xor
+	// pixels are identified in cursor
+	if (outline)
+	{
+		tmp = XcursorImageCreate(width, height);
+		memset(tmp->pixels, 0, tmp->width * tmp->height * 4);
+		xcursor_stencil(cimg, tmp, -1, 0, 0xffffffff);
+		xcursor_stencil(cimg, tmp, 1, 0, 0xffffffff);
+		xcursor_stencil(cimg, tmp, 0, -1, 0xffffffff);
+		xcursor_stencil(cimg, tmp, 0, 1, 0xffffffff);
+		xcursor_merge(cimg, tmp);
+		xcursor_merge(tmp, cimg);
+		XcursorImageDestroy(tmp);
+	}
 
-	xcursor =
-		XCreatePixmapCursor(g_display, (Pixmap) cursorglyph,
-				    (Pixmap) maskglyph, &fg, &bg, x, y);
+	cursor = XcursorImageLoadCursor(g_display, cimg);
+	XcursorImageDestroy(cimg);
+	if (!cursor)
+	{
+		logger(GUI, Error, "ui_create_cursor(): XcursorImageLoadCursor() failed");
+		return g_null_cursor;
+	}
 
-	ui_destroy_glyph(maskglyph);
-	ui_destroy_glyph(cursorglyph);
-	xfree(mask);
-	xfree(cursor);
-	return (RD_HCURSOR) xcursor;
+	return (RD_HCURSOR) cursor;
 }
 
 void
 ui_set_cursor(RD_HCURSOR cursor)
 {
 	extern RD_BOOL g_local_cursor;
-	if (!g_local_cursor)
-	{
-		g_current_cursor = (Cursor) cursor;
-		XDefineCursor(g_display, g_wnd, g_current_cursor);
-		ON_ALL_SEAMLESS_WINDOWS(XDefineCursor, (g_display, sw->wnd, g_current_cursor));
-	}
+	if (g_local_cursor) return ;
+	logger(GUI, Debug, "ui_set_cursor(): g_current_cursor = %p, new = %p",
+	       g_current_cursor, cursor);
+
+	g_current_cursor = (Cursor) cursor;
+	XDefineCursor(g_display, g_wnd, g_current_cursor);
+	ON_ALL_SEAMLESS_WINDOWS(XDefineCursor, (g_display, sw->wnd, g_current_cursor));
 }
 
 void
@@ -3160,6 +3207,12 @@ void
 ui_set_null_cursor(void)
 {
 	ui_set_cursor(g_null_cursor);
+}
+
+void
+ui_set_standard_cursor(void)
+{
+	XUndefineCursor(g_display, g_wnd);
 }
 
 #define MAKE_XCOLOR(xc,c) \
@@ -3749,6 +3802,9 @@ ui_draw_glyph(int mixmode,
 	      /* src */ RD_HGLYPH glyph, int srcx, int srcy,
 	      int bgcolour, int fgcolour)
 {
+	UNUSED(srcx);
+	UNUSED(srcy);
+
 	SET_FOREGROUND(fgcolour);
 	SET_BACKGROUND(bgcolour);
 
@@ -3803,6 +3859,9 @@ ui_draw_text(uint8 font, uint8 flags, uint8 opcode, int mixmode, int x, int y,
 	     int boxx, int boxy, int boxcx, int boxcy, BRUSH * brush,
 	     int bgcolour, int fgcolour, uint8 * text, uint8 length)
 {
+	UNUSED(opcode);
+	UNUSED(brush);
+
 	/* TODO: use brush appropriately */
 
 	FONTGLYPH *glyph;
@@ -4234,6 +4293,8 @@ ui_seamless_create_window(unsigned long id, unsigned long group, unsigned long p
 void
 ui_seamless_destroy_window(unsigned long id, unsigned long flags)
 {
+	UNUSED(flags);
+
 	seamless_window *sw;
 
 	if (!g_seamless_active)
@@ -4255,6 +4316,8 @@ ui_seamless_destroy_window(unsigned long id, unsigned long flags)
 void
 ui_seamless_destroy_group(unsigned long id, unsigned long flags)
 {
+	UNUSED(flags);
+
 	seamless_window *sw, *sw_next;
 
 	if (!g_seamless_active)
@@ -4367,6 +4430,8 @@ ui_seamless_delicon(unsigned long id, const char *format, int width, int height)
 void
 ui_seamless_move_window(unsigned long id, int x, int y, int width, int height, unsigned long flags)
 {
+	UNUSED(flags);
+
 	seamless_window *sw;
 
 	if (!g_seamless_active)
@@ -4490,6 +4555,8 @@ ui_seamless_restack_window(unsigned long id, unsigned long behind, unsigned long
 void
 ui_seamless_settitle(unsigned long id, const char *title, unsigned long flags)
 {
+	UNUSED(flags);
+
 	seamless_window *sw;
 
 	if (!g_seamless_active)
@@ -4511,6 +4578,8 @@ ui_seamless_settitle(unsigned long id, const char *title, unsigned long flags)
 void
 ui_seamless_setstate(unsigned long id, unsigned int state, unsigned long flags)
 {
+	UNUSED(flags);
+
 	seamless_window *sw;
 
 	if (!g_seamless_active)
@@ -4564,6 +4633,8 @@ ui_seamless_setstate(unsigned long id, unsigned int state, unsigned long flags)
 void
 ui_seamless_syncbegin(unsigned long flags)
 {
+	UNUSED(flags);
+
 	if (!g_seamless_active)
 		return;
 
@@ -4605,7 +4676,7 @@ ui_seamless_ack(unsigned int serial)
 static int g_bkrh[2] = {-1, -1};
 static int g_bkwh[2] = {-1, -1};
 
-#ifdef PROFILE
+#ifdef PROFILE_SURGE
 static struct timeval measure_start;
 static struct timeval measure_stop;
 #endif
@@ -4650,7 +4721,7 @@ BackgroundBackStoreStartup()
 			exit(3);
 		}
 	}
-#ifdef PROFILE
+#ifdef PROFILE_SURGE
 	XFlush(g_display);
 	gettimeofday(&measure_start, NULL);
 #endif
@@ -4666,7 +4737,7 @@ BackgroundBackStoreStartup()
 static void
 BackgroundBackStoreShutdown()
 {
-#ifdef PROFILE
+#ifdef PROFILE_SURGE
 	struct timeval tv_diff;
 #endif
 	char ignored;
@@ -4682,11 +4753,11 @@ BackgroundBackStoreShutdown()
 		XFree(g_backstore2);
 		g_backstore2 = NULL;
 	}
-#ifdef PROFILE
+#ifdef PROFILE_SURGE
 	XFlush(g_display);
 	gettimeofday(&measure_stop, NULL);
 #endif
-#ifdef PROFILE
+#ifdef PROFILE_SURGE
 	tv_diff.tv_sec = measure_stop.tv_sec - measure_start.tv_sec;
 	if (measure_stop.tv_usec < measure_start.tv_usec) {
 		tv_diff.tv_sec -= 1;

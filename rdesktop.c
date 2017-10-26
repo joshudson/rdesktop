@@ -85,7 +85,6 @@ int g_server_depth = -1;
 int g_win_button_size = 0;	/* If zero, disable single app mode */
 int g_surge = -1;		/* If -1, disabled */
 RD_BOOL g_network_error = False;
-RD_BOOL g_bitmap_compression = True;
 RD_BOOL g_sendmotion = True;
 RD_BOOL g_bitmap_cache = True;
 RD_BOOL g_bitmap_cache_persist_enable = False;
@@ -114,9 +113,10 @@ char g_seamless_spawn_cmd[512];
 RD_BOOL g_seamless_persistent_mode = True;
 RD_BOOL g_user_quit = False;
 uint32 g_embed_wnd;
-uint32 g_rdp5_performanceflags =
-	PERF_DISABLE_WALLPAPER | PERF_DISABLE_FULLWINDOWDRAG | PERF_DISABLE_MENUANIMATIONS |
-	PERF_DISABLE_CURSOR_SHADOW | PERF_ENABLE_FONT_SMOOTHING;
+uint32 g_rdp5_performanceflags = (PERF_DISABLE_WALLPAPER |
+				  PERF_DISABLE_FULLWINDOWDRAG |
+				  PERF_DISABLE_MENUANIMATIONS |
+				  PERF_ENABLE_FONT_SMOOTHING);
 /* Session Directory redirection */
 RD_BOOL g_redirect = False;
 char *g_redirect_server;
@@ -155,13 +155,6 @@ extern RDPDR_DEVICE g_rdpdr_device[];
 extern uint32 g_num_devices;
 extern char *g_rdpdr_clientname;
 
-#ifdef RDP2VNC
-extern int rfb_port;
-extern int defer_time;
-void
-rdp2vnc_connect(char *server, uint32 flags, char *domain, char *password,
-		char *shell, char *directory);
-#endif
 /* Display usage information */
 static void
 usage(char *program)
@@ -172,10 +165,6 @@ usage(char *program)
 	fprintf(stderr, "See http://www.rdesktop.org/ for more information.\n\n");
 
 	fprintf(stderr, "Usage: %s [options] server[:port]\n", program);
-#ifdef RDP2VNC
-	fprintf(stderr, "   -V: vnc port\n");
-	fprintf(stderr, "   -Q: defer time (ms)\n");
-#endif
 	fprintf(stderr, "   -u: user name\n");
 	fprintf(stderr, "   -d: domain\n");
 	fprintf(stderr, "   -s: shell / seamless application to start remotely\n");
@@ -283,7 +272,7 @@ handle_disconnect_reason(RD_BOOL deactivated, uint16 reason)
 
 	switch (reason)
 	{
-		case exDiscReasonNoInfo:
+		case ERRINFO_NO_INFO:
 			text = "No information available";
 			if (deactivated)
 				retval = EX_OK;
@@ -291,134 +280,206 @@ handle_disconnect_reason(RD_BOOL deactivated, uint16 reason)
 				retval = EXRD_UNKNOWN;
 			break;
 
-		case exDiscReasonAPIInitiatedDisconnect:
-			text = "Server initiated disconnect";
-			retval = EXRD_API_DISCONNECT;
+		case ERRINFO_RPC_INITIATED_DISCONNECT:
+			text = "Administrator initiated disconnect";
+			retval = EXRD_DISCONNECT_BY_ADMIN;
 			break;
 
-		case exDiscReasonAPIInitiatedLogoff:
-			text = "Server initiated logoff";
-			retval = EXRD_API_LOGOFF;
+		case ERRINFO_RPC_INITIATED_LOGOFF:
+			text = "Administrator initiated logout";
+			retval = EXRD_LOGOFF_BY_ADMIN;
 			break;
 
-		case exDiscReasonServerIdleTimeout:
-			text = "Server idle timeout reached";
+		case ERRINFO_IDLE_TIMEOUT:
+			text = "Server idle session time limit reached";
 			retval = EXRD_IDLE_TIMEOUT;
 			break;
 
-		case exDiscReasonServerLogonTimeout:
-			text = "Server logon timeout reached";
+		case ERRINFO_LOGON_TIMEOUT:
+			text = "Server active session time limit reached";
 			retval = EXRD_LOGON_TIMEOUT;
 			break;
 
-		case exDiscReasonReplacedByOtherConnection:
+		case ERRINFO_DISCONNECTED_BY_OTHERCONNECTION:
 			text = "The session was replaced";
 			retval = EXRD_REPLACED;
 			break;
 
-		case exDiscReasonOutOfMemory:
+		case ERRINFO_OUT_OF_MEMORY:
 			text = "The server is out of memory";
 			retval = EXRD_OUT_OF_MEM;
 			break;
 
-		case exDiscReasonServerDeniedConnection:
+		case ERRINFO_SERVER_DENIED_CONNECTION:
 			text = "The server denied the connection";
 			retval = EXRD_DENIED;
 			break;
 
-		case exDiscReasonServerDeniedConnectionFips:
-			text = "The server denied the connection for security reason";
+		case ERRINFO_SERVER_DENIED_CONNECTION_FIPS:
+			text = "The server denied the connection for security reasons";
 			retval = EXRD_DENIED_FIPS;
 			break;
 
-		case exDiscReasonServerInsufficientPrivileges:
+		case ERRINFO_SERVER_INSUFFICIENT_PRIVILEGES:
 			text = "The user cannot connect to the server due to insufficient access privileges.";
 			retval = EXRD_INSUFFICIENT_PRIVILEGES;
 			break;
 
-		case exDiscReasonServerFreshCredentialsRequired:
+		case ERRINFO_SERVER_FRESH_CREDENTIALS_REQUIRED:
 			text = "The server does not accept saved user credentials and requires that the user enter their credentials for each connection.";
 			retval = EXRD_FRESH_CREDENTIALS_REQUIRED;
 			break;
 
-		case exDiscReasonRPCInitiatedDisconnectByUser:
-			text = "Disconnect initiated by administration tool";
-			retval = EXRD_RPC_DISCONNECT_BY_USER;
-			break;
-
-		case exDiscReasonByUser:
+		case ERRINFO_RPC_INITIATED_DISCONNECT_BYUSER:
 			text = "Disconnect initiated by user";
 			retval = EXRD_DISCONNECT_BY_USER;
 			break;
 
-		case exDiscReasonLicenseInternal:
+		case ERRINFO_LOGOFF_BYUSER:
+			text = "Logout initiated by user";
+			retval = EXRD_LOGOFF_BY_USER;
+			break;
+
+		case ERRINFO_LICENSE_INTERNAL:
 			text = "Internal licensing error";
 			retval = EXRD_LIC_INTERNAL;
 			break;
 
-		case exDiscReasonLicenseNoLicenseServer:
+		case ERRINFO_LICENSE_NO_LICENSE_SERVER:
 			text = "No license server available";
 			retval = EXRD_LIC_NOSERVER;
 			break;
 
-		case exDiscReasonLicenseNoLicense:
+		case ERRINFO_LICENSE_NO_LICENSE:
 			text = "No valid license available";
 			retval = EXRD_LIC_NOLICENSE;
 			break;
 
-		case exDiscReasonLicenseErrClientMsg:
-			text = "Invalid licensing message";
+		case ERRINFO_LICENSE_BAD_CLIENT_MSG:
+			text = "Invalid licensing message from client";
 			retval = EXRD_LIC_MSG;
 			break;
 
-		case exDiscReasonLicenseHwidDoesntMatchLicense:
-			text = "Hardware id doesn't match software license";
+		case ERRINFO_LICENSE_HWID_DOESNT_MATCH_LICENSE:
+			text = "The client license has been modified and does no longer match the hardware ID";
 			retval = EXRD_LIC_HWID;
 			break;
 
-		case exDiscReasonLicenseErrClientLicense:
-			text = "Client license error";
+		case ERRINFO_LICENSE_BAD_CLIENT_LICENSE:
+			text = "The client license is in an invalid format";
 			retval = EXRD_LIC_CLIENT;
 			break;
 
-		case exDiscReasonLicenseCantFinishProtocol:
+		case ERRINFO_LICENSE_CANT_FINISH_PROTOCOL:
 			text = "Network error during licensing protocol";
 			retval = EXRD_LIC_NET;
 			break;
 
-		case exDiscReasonLicenseClientEndedProtocol:
+		case ERRINFO_LICENSE_CLIENT_ENDED_PROTOCOL:
 			text = "Licensing protocol was not completed";
 			retval = EXRD_LIC_PROTO;
 			break;
 
-		case exDiscReasonLicenseErrClientEncryption:
+		case ERRINFO_LICENSE_BAD_CLIENT_ENCRYPTION:
 			text = "Incorrect client license encryption";
 			retval = EXRD_LIC_ENC;
 			break;
 
-		case exDiscReasonLicenseCantUpgradeLicense:
-			text = "Can't upgrade license";
+		case ERRINFO_LICENSE_CANT_UPGRADE_LICENSE:
+			text = "Can't upgrade or renew license";
 			retval = EXRD_LIC_UPGRADE;
 			break;
 
-		case exDiscReasonLicenseNoRemoteConnections:
+		case ERRINFO_LICENSE_NO_REMOTE_CONNECTIONS:
 			text = "The server is not licensed to accept remote connections";
 			retval = EXRD_LIC_NOREMOTE;
 			break;
 
+		case ERRINFO_CB_DESTINATION_NOT_FOUND:
+			text = "The target endpoint chosen by the broker could not be found";
+			retval = EXRD_CB_DEST_NOT_FOUND;
+			break;
+
+		case ERRINFO_CB_LOADING_DESTINATION:
+			text = "The target endpoint is disconnecting from the broker";
+			retval = EXRD_CB_DEST_LOADING;
+			break;
+
+		case ERRINFO_CB_REDIRECTING_TO_DESTINATION:
+			text = "Error occured while being redirected by broker";
+			retval = EXRD_CB_REDIR_DEST;
+			break;
+
+		case ERRINFO_CB_SESSION_ONLINE_VM_WAKE:
+			text = "Error while the endpoint VM was being awakened by the broker";
+			retval = EXRD_CB_VM_WAKE;
+			break;
+
+		case ERRINFO_CB_SESSION_ONLINE_VM_BOOT:
+			text = "Error while the endpoint VM was being started by the broker";
+			retval = EXRD_CB_VM_BOOT;
+			break;
+
+		case ERRINFO_CB_SESSION_ONLINE_VM_NO_DNS:
+			text = "The IP address of the endpoint VM could not be determined by the broker";
+			retval = EXRD_CB_VM_NODNS;
+			break;
+
+		case ERRINFO_CB_DESTINATION_POOL_NOT_FREE:
+			text = "No available endpoints in the connection broker pool";
+			retval = EXRD_CB_DEST_POOL_NOT_FREE;
+			break;
+
+		case ERRINFO_CB_CONNECTION_CANCELLED:
+			text = "Connection processing cancelled by the broker";
+			retval = EXRD_CB_CONNECTION_CANCELLED;
+			break;
+
+		case ERRINFO_CB_CONNECTION_ERROR_INVALID_SETTINGS:
+			text = "The connection settings could not be validated by the broker";
+			retval = EXRD_CB_INVALID_SETTINGS;
+			break;
+
+		case ERRINFO_CB_SESSION_ONLINE_VM_BOOT_TIMEOUT:
+			text = "Timeout while the endpoint VM was being started by the broker";
+			retval = EXRD_CB_VM_BOOT_TIMEOUT;
+			break;
+
+		case ERRINFO_CB_SESSION_ONLINE_VM_SESSMON_FAILED:
+			text = "Session monitoring error while the endpoint VM was being started by the broker";
+			retval = EXRD_CB_VM_BOOT_SESSMON_FAILED;
+			break;
+
+		case ERRINFO_REMOTEAPPSNOTENABLED:
+			text = "The server can only host Remote Applications";
+			retval = EXRD_RDP_REMOTEAPPSNOTENABLED;
+			break;
+
+		case ERRINFO_UPDATESESSIONKEYFAILED:
+			text = "Update of session keys failed";
+			retval = EXRD_RDP_UPDATESESSIONKEYFAILED;
+			break;
+
+		case ERRINFO_DECRYPTFAILED:
+			text = "Decryption or session key creation failed";
+			retval = EXRD_RDP_DECRYPTFAILED;
+			break;
+
+		case ERRINFO_ENCRYPTFAILED:
+			text = "Encryption failed";
+			retval = EXRD_RDP_ENCRYPTFAILED;
+			break;
+
 		default:
-			if (reason > 0x1000 && reason < 0x7fff)
-			{
-				text = "Internal protocol error";
-			}
-			else
-			{
-				text = "Unknown reason";
-			}
+			text = "Unknown reason";
 			retval = EXRD_UNKNOWN;
 	}
-	if (reason != exDiscReasonNoInfo)
+
+	if (reason > 0x1000 && reason < 0x7fff && retval == EXRD_UNKNOWN) {
+		fprintf(stderr, "Internal protocol error: %x", reason);
+	} else if (reason != ERRINFO_NO_INFO) {
 		fprintf(stderr, "disconnect: %s.\n", text);
+	}
 
 	return retval;
 }
@@ -441,11 +502,22 @@ read_password(char *password, int size)
 	struct termios tios;
 	RD_BOOL ret = False;
 	int istty = 0;
+	const char *prompt;
 	char *p;
+
+
+	if (g_use_password_as_pin)
+	{
+		prompt = "Smart card PIN: ";
+	}
+	else
+	{
+		prompt = "Password: ";
+	}
 
 	if (tcgetattr(STDIN_FILENO, &tios) == 0)
 	{
-		fprintf(stderr, "Password: ");
+		fprintf(stderr, prompt);
 		tios.c_lflag &= ~ECHO;
 		tcsetattr(STDIN_FILENO, TCSANOW, &tios);
 		istty = 1;
@@ -528,7 +600,7 @@ main(int argc, char *argv[])
 	char domain[256];
 	char shell[256];
 	char directory[256];
-	RD_BOOL prompt_password, deactivated;
+	RD_BOOL deactivated;
 	struct passwd *pw;
 	uint32 flags, ext_disc_reason = 0;
 	char *p;
@@ -565,36 +637,16 @@ main(int argc, char *argv[])
 	flags = RDP_INFO_MOUSE | RDP_INFO_DISABLECTRLALTDEL
 		| RDP_INFO_UNICODE | RDP_INFO_MAXIMIZESHELL | RDP_INFO_ENABLEWINDOWSKEY;
 
-	prompt_password = False;
 	g_seamless_spawn_cmd[0] = domain[0] = g_password[0] = shell[0] = directory[0] = 0;
 	g_embed_wnd = 0;
 
 	g_num_devices = 0;
 
-#ifdef RDP2VNC
-#define VNCOPT "V:Q:"
-#else
-#define VNCOPT
-#endif
 	while ((c = getopt(argc, argv,
-			   VNCOPT "A:u:L:d:s:c:p:n:k:g:o:fbBeEitmMzCDKS:T:NX:a:x:Pr:045vh?")) != -1)
+			   "A:u:L:d:s:c:p:n:k:g:o:fbBeEitmMzCDKS:T:NX:a:x:Pr:045vh?")) != -1)
 	{
 		switch (c)
 		{
-#ifdef RDP2VNC
-			case 'V':
-				rfb_port = strtol(optarg, NULL, 10);
-				if (rfb_port < 100)
-					rfb_port += 5900;
-				break;
-
-			case 'Q':
-				defer_time = strtol(optarg, NULL, 10);
-				if (defer_time < 0)
-					defer_time = 0;
-				break;
-#endif
-
 			case 'A':
 				g_seamless_rdp = True;
 				STRNCPY(g_seamless_shell, optarg, sizeof(g_seamless_shell));
@@ -624,19 +676,16 @@ main(int argc, char *argv[])
 				break;
 
 			case 'p':
-				if ((optarg[0] == '-') && (optarg[1] == 0))
+				if ((optarg[0] != '-') && (optarg[1] != 0))
 				{
-					prompt_password = True;
-					break;
+					STRNCPY(g_password, optarg, sizeof(g_password));
+					flags |= RDP_INFO_AUTOLOGON;
+
+					/* try to overwrite argument so it won't appear in ps */
+					p = optarg;
+					while (*p)
+						*(p++) = 'X';
 				}
-
-				STRNCPY(g_password, optarg, sizeof(g_password));
-				flags |= RDP_INFO_AUTOLOGON;
-
-				/* try to overwrite argument so it won't appear in ps */
-				p = optarg;
-				while (*p)
-					*(p++) = 'X';
 				break;
 #ifdef WITH_SCARD
 			case 'i':
@@ -703,7 +752,7 @@ main(int argc, char *argv[])
 					g_dpi = strtol(p + 1, &p, 10);
 					if (g_dpi <= 0)
 					{
-						logger(Core, Error, "invalid geometry\n");
+						logger(Core, Error, "invalid DPI: expected a positive integer after @\n");
 						return EX_USAGE;
 					}
 				}
@@ -745,6 +794,7 @@ main(int argc, char *argv[])
 				break;
 			case 'M':
 				g_local_cursor = True;
+				break;
 
 			case 'C':
 				g_owncolmap = True;
@@ -808,27 +858,24 @@ main(int argc, char *argv[])
 			case 'x':
 				if (str_startswith(optarg, "m"))	/* modem */
 				{
-					g_rdp5_performanceflags = PERF_DISABLE_CURSOR_SHADOW |
-						PERF_DISABLE_WALLPAPER | PERF_DISABLE_FULLWINDOWDRAG
-						| PERF_DISABLE_MENUANIMATIONS |
-						PERF_DISABLE_THEMING;
+					g_rdp5_performanceflags = (PERF_DISABLE_CURSOR_SHADOW |
+								   PERF_DISABLE_WALLPAPER |
+								   PERF_DISABLE_FULLWINDOWDRAG |
+								   PERF_DISABLE_MENUANIMATIONS |
+								   PERF_DISABLE_THEMING);
 				}
 				else if (str_startswith(optarg, "b"))	/* broadband */
 				{
-					g_rdp5_performanceflags =
-						PERF_DISABLE_CURSOR_SHADOW | PERF_DISABLE_WALLPAPER
-						| PERF_ENABLE_FONT_SMOOTHING;
+					g_rdp5_performanceflags = (PERF_DISABLE_WALLPAPER |
+								   PERF_ENABLE_FONT_SMOOTHING);
 				}
 				else if (str_startswith(optarg, "l"))	/* lan */
 				{
-					g_rdp5_performanceflags =
-						PERF_DISABLE_CURSOR_SHADOW |
-						PERF_ENABLE_FONT_SMOOTHING;
+					g_rdp5_performanceflags = PERF_ENABLE_FONT_SMOOTHING;
 				}
 				else
 				{
-					g_rdp5_performanceflags = PERF_DISABLE_CURSOR_SHADOW |
-						strtol(optarg, NULL, 16);
+					g_rdp5_performanceflags = strtol(optarg, NULL, 16);
 				}
 				break;
 
@@ -1016,6 +1063,12 @@ main(int argc, char *argv[])
 		return EX_USAGE;
 	}
 	if (g_surge >= 0) g_ownbackstore = True;
+	if (g_local_cursor)
+	{
+		/* there is no point wasting bandwidth on cursor shadows
+                 * that we're just going to throw out anyway */
+		g_rdp5_performanceflags |= PERF_DISABLE_CURSOR_SHADOW;
+	}
 
 	STRNCPY(server, argv[optind], sizeof(server));
 	parse_server_and_port(server);
@@ -1119,20 +1172,25 @@ main(int argc, char *argv[])
 	if (locale)
 		xfree(locale);
 
-
-	if (prompt_password && read_password(g_password, sizeof(g_password)))
-		flags |= RDP_INFO_AUTOLOGON;
+	/* If no password provided at this point, prompt for password / pin */
+	if (!g_password[0])
+	{
+		if (read_password(g_password, sizeof(g_password)))
+		{
+			flags |= RDP_INFO_AUTOLOGON;
+		}
+		else
+		{
+			logger(Core, Error, "Failed to read password or pin from stdin");
+			return EX_OSERR;
+		}
+	}
 
 	if (g_title[0] == 0)
 	{
 		strcpy(g_title, "rdesktop - ");
 		strncat(g_title, server, sizeof(g_title) - sizeof("rdesktop - "));
 	}
-
-#ifdef RDP2VNC
-	rdp2vnc_connect(server, flags, domain, g_password, shell, directory);
-	return EX_OK;
-#else
 
 	/* Only startup ctrl functionality is seamless are used for now. */
 	if (g_use_ctrl && g_seamless_rdp)
@@ -1189,7 +1247,6 @@ main(int argc, char *argv[])
 			   and therefor we just clear this error before we connect to redirected server.
 			 */
 			g_network_error = False;
-			g_redirect = False;
 		}
 
 		ui_init_connection();
@@ -1275,7 +1332,6 @@ main(int argc, char *argv[])
 
 	return handle_disconnect_reason(deactivated, ext_disc_reason);
 
-#endif
 	if (g_redirect_username)
 		xfree(g_redirect_username);
 
@@ -1431,7 +1487,8 @@ void
 hexdump(unsigned char *p, unsigned int len)
 {
 	unsigned char *line = p;
-	int i, thisline, offset = 0;
+	unsigned offset = 0;
+	int i, thisline;
 
 	while (offset < len)
 	{
@@ -1789,11 +1846,16 @@ save_licence(unsigned char *data, int length)
 void
 rd_create_ui()
 {
-	/* only create a window if we dont have one intialized */
 	if (!ui_have_window())
 	{
+		/* create a window if we dont have one intialized */
 		if (!ui_create_window())
 			exit(EX_OSERR);
+	}
+	else
+	{
+		/* reset clipping if we already have a window */
+		ui_reset_clip();
 	}
 }
 
