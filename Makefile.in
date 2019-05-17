@@ -25,14 +25,14 @@ SOUNDOBJ    = @SOUNDOBJ@
 SCARDOBJ    = @SCARDOBJ@
 CREDSSPOBJ  = @CREDSSPOBJ@
 
-RDPOBJ   = tcp.o asn.o iso.o mcs.o secure.o licence.o rdp.o orders.o bitmap.o cache.o rdp5.o channels.o rdpdr.o serial.o printer.o disk.o parallel.o printercache.o mppc.o pstcache.o lspci.o seamless.o ssl.o utils.o stream.o
+RDPOBJ   = tcp.o asn.o iso.o mcs.o secure.o licence.o rdp.o orders.o bitmap.o cache.o rdp5.o channels.o rdpdr.o serial.o printer.o disk.o parallel.o printercache.o mppc.o pstcache.o lspci.o seamless.o ssl.o utils.o stream.o dvc.o rdpedisp.o
 X11OBJ   = rdesktop.o xwin.o xwinsurge.o xkeymap.o ewmhints.o xclip.o cliprdr.o ctrl.o
 
 .PHONY: all
 all: $(TARGETS)
 
 rdesktop: $(X11OBJ) $(SOUNDOBJ) $(RDPOBJ) $(SCARDOBJ) $(CREDSSPOBJ)
-	$(CC) $(CFLAGS) -o rdesktop $(X11OBJ) $(SOUNDOBJ) $(RDPOBJ) $(SCARDOBJ) $(CREDSSPOBJ) $(LDFLAGS) -lX11 -lXext
+	$(CC) $(CFLAGS) -o rdesktop $(X11OBJ) $(SOUNDOBJ) $(RDPOBJ) $(SCARDOBJ) $(CREDSSPOBJ) $(LDFLAGS) -lX11 -lXext -lpthread
 
 .PHONY: install
 install: installbin installkeymaps installman

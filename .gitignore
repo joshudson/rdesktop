@@ -1,8 +1,9 @@
 rdesktop
-rdp2vnc
 autom4te.cache
-Makefile
+/Makefile
 config.log
 config.status
 configure
 rdesktop*.tar.gz
+aclocal.m4
+*.o

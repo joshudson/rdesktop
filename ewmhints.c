@@ -41,7 +41,7 @@ static Atom g_net_wm_state_maximized_vert_atom, g_net_wm_state_maximized_horz_at
 Atom g_net_wm_state_atom, g_net_wm_desktop_atom, g_net_wm_ping_atom;
 
 /* 
-   Get window property value (32 bit format) 
+   Get window property value (32-bit format) 
    Returns zero on success, -1 on error
 */
 static int
@@ -150,7 +150,7 @@ get_current_workarea(uint32 * x, uint32 * y, uint32 * width, uint32 * height)
 
 	if (nitems_return % 4)
 	{
-		logger(GUI, Error, "get_current_workare(),_NET_WORKAREA has bad length");
+		logger(GUI, Error, "get_current_workarea(),_NET_WORKAREA has bad length");
 		return (-1);
 	}
 
@@ -246,7 +246,7 @@ ewmh_modify_state(Window wnd, int add, Atom atom1, Atom atom2)
 	XEvent xevent;
 
 	int result;
-	unsigned long nitems;
+	unsigned long i, nitems;
 	unsigned char *props;
 	uint32 state = WithdrawnState;
 
@@ -281,7 +281,6 @@ ewmh_modify_state(Window wnd, int add, Atom atom1, Atom atom2)
 		else
 		{
 			Atom *atoms;
-			int i;
 
 			if (get_property_value(wnd, "_NET_WM_STATE", 64, &nitems, &props, 1) < 0)
 				return 0;
@@ -438,7 +437,7 @@ ewmh_set_window_modal(Window wnd)
 }
 
 void
-ewmh_set_icon(Window wnd, int width, int height, const char *rgba_data)
+ewmh_set_icon(Window wnd, uint32 width, uint32 height, const char *rgba_data)
 {
 	unsigned long nitems, i;
 	unsigned char *props;
@@ -481,7 +480,7 @@ ewmh_set_icon(Window wnd, int width, int height, const char *rgba_data)
 	icon[1] = height;
 
 	/* Convert RGBA -> ARGB */
-	for (i = 0; i < width * height; i++)
+	for (i = 0; i < (width * height); i++)
 	{
 		icon[i + 2] =
 			rgba_data[i * 4 + 3] << 24 |
@@ -500,7 +499,7 @@ ewmh_set_icon(Window wnd, int width, int height, const char *rgba_data)
 }
 
 void
-ewmh_del_icon(Window wnd, int width, int height)
+ewmh_del_icon(Window wnd, uint32 width, uint32 height)
 {
 	unsigned long nitems, i, icon_size;
 	unsigned char *props;

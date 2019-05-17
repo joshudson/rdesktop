@@ -1,7 +1,8 @@
 /*  -*- c-basic-offset: 8 -*-
    rdesktop: A Remote Desktop Protocol client.
    Support for the Matrox "lspci" channel
-   Copyright (C) 2005 Matrox Graphics Inc. 
+   Copyright (C) 2005 Matrox Graphics Inc.
+   Copyright 2018 Henrik Andersson <hean01@cendio.se> for Cendio AB
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -43,13 +44,14 @@ static void lspci_send(const char *output);
 static RD_BOOL
 handle_child_line(const char *line, void *data)
 {
+	UNUSED(data);
 	const char *val;
 	char buf[1024];
 
 	if (str_startswith(line, "Class:"))
 	{
 		val = line + sizeof("Class:");
-		/* Skip whitespace and second Class: occurance */
+		/* Skip whitespace and second Class: occurrence */
 		val += strspn(val, " \t") + sizeof("Class");
 		current_device.klass = strtol(val, NULL, 16);
 	}
@@ -108,6 +110,7 @@ handle_child_line(const char *line, void *data)
 static RD_BOOL
 lspci_process_line(const char *line, void *data)
 {
+	UNUSED(data);
 	char *lspci_command[5] = { "lspci", "-m", "-n", "-v", NULL };
 
 	if (!strcmp(line, "LSPCI"))
@@ -119,7 +122,7 @@ lspci_process_line(const char *line, void *data)
 	}
 	else
 	{
-		logger(Core, Error, "lspci_process_line(), invlid line '%s'", line);
+		logger(Core, Error, "lspci_process_line(), invalid line '%s'", line);
 	}
 	return True;
 }
@@ -133,10 +136,11 @@ lspci_process(STREAM s)
 	static char *rest = NULL;
 	char *buf;
 
-	pkglen = s->end - s->p;
+	pkglen = s_remaining(s);
 	/* str_handle_lines requires null terminated strings */
 	buf = xmalloc(pkglen + 1);
-	STRNCPY(buf, (char *) s->p, pkglen + 1);
+	in_uint8a(s, buf, pkglen);
+	buf[pkglen] = '\0';
 	str_handle_lines(buf, &rest, lspci_process_line, NULL);
 	xfree(buf);
 }
@@ -160,6 +164,7 @@ lspci_send(const char *output)
 
 	len = strlen(output);
 	s = channel_init(lspci_channel, len);
-	out_uint8p(s, output, len) s_mark_end(s);
+	out_uint8a(s, output, len) s_mark_end(s);
 	channel_send(s, lspci_channel);
+	s_free(s);
 }

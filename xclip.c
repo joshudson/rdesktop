@@ -4,6 +4,7 @@
    Copyright 2003-2008 Erik Forsberg <forsberg@cendio.se> for Cendio AB
    Copyright (C) Matthew Chapman <matthewc.unsw.edu.au> 2003-2008
    Copyright 2006-2011 Pierre Ossman <ossman@cendio.se> for Cendio AB
+   Copyright 2016 Alexander Zakharov <uglym8@gmail.com>
    Copyright 2017 Henrik Andersson <hean01@cendio.se> for Cendio AB
 
    This program is free software: you can redistribute it and/or modify
@@ -154,7 +155,7 @@ utf16_lf2crlf(uint8 * data, uint32 * size)
 {
 	uint8 *result;
 	uint16 *inptr, *outptr;
-	RD_BOOL swap_endianess;
+	RD_BOOL swap_endianness;
 
 	/* Worst case: Every char is LF */
 	result = xmalloc((*size * 2) + 2);
@@ -165,16 +166,16 @@ utf16_lf2crlf(uint8 * data, uint32 * size)
 	outptr = (uint16 *) result;
 
 	/* Check for a reversed BOM */
-	swap_endianess = (*inptr == 0xfffe);
+	swap_endianness = (*inptr == 0xfffe);
 
 	uint16 uvalue_previous = 0;	/* Kept so we'll avoid translating CR-LF to CR-CR-LF */
 	while ((uint8 *) inptr < data + *size)
 	{
 		uint16 uvalue = *inptr;
-		if (swap_endianess)
+		if (swap_endianness)
 			uvalue = ((uvalue << 8) & 0xff00) + (uvalue >> 8);
 		if ((uvalue == 0x0a) && (uvalue_previous != 0x0d))
-			*outptr++ = swap_endianess ? 0x0d00 : 0x0d;
+			*outptr++ = swap_endianness ? 0x0d00 : 0x0d;
 		uvalue_previous = uvalue;
 		*outptr++ = *inptr++;
 	}
@@ -219,11 +220,15 @@ xclip_provide_selection(XSelectionRequestEvent * req, Atom type, unsigned int fo
 			uint32 length)
 {
 	XEvent xev;
+	char *target_name, *property_name;
 
+	target_name = XGetAtomName(g_display, req->target);
+	property_name = XGetAtomName(g_display, req->property);
 	logger(Clipboard, Debug,
 	       "xclip_provide_selection(), requestor=0x%08x, target=%s, property=%s, length=%u",
-	       (unsigned) req->requestor, XGetAtomName(g_display, req->target),
-	       XGetAtomName(g_display, req->property), (unsigned) length);
+	       (unsigned) req->requestor, target_name, property_name, (unsigned) length);
+	XFree(target_name);
+	XFree(property_name);
 
 	XChangeProperty(g_display, req->requestor, req->property,
 			type, format, PropModeReplace, data, length);
@@ -246,11 +251,15 @@ static void
 xclip_refuse_selection(XSelectionRequestEvent * req)
 {
 	XEvent xev;
+	char *target_name, *property_name;
 
+	target_name = XGetAtomName(g_display, req->target);
+	property_name = XGetAtomName(g_display, req->property);
 	logger(Clipboard, Debug,
 	       "xclip_refuse_selection(), requestor=0x%08x, target=%s, property=%s",
-	       (unsigned) req->requestor, XGetAtomName(g_display, req->target),
-	       XGetAtomName(g_display, req->property));
+	       (unsigned) req->requestor, target_name, property_name);
+	XFree(target_name);
+	XFree(property_name);
 
 	xev.xselection.type = SelectionNotify;
 	xev.xselection.serial = 0;
@@ -291,8 +300,12 @@ helper_cliprdr_send_empty_response()
 static RD_BOOL
 xclip_send_data_with_convert(uint8 * source, size_t source_size, Atom target)
 {
+	char *target_name;
+
+	target_name = XGetAtomName(g_display, target);
 	logger(Clipboard, Debug, "xclip_send_data_with_convert(), target=%s, size=%u",
-	       XGetAtomName(g_display, target), (unsigned) source_size);
+	       target_name, (unsigned) source_size);
+	XFree(target_name);
 
 #ifdef USE_UNICODE_CLIPBOARD
 	if (target == format_string_atom ||
@@ -506,20 +519,26 @@ xclip_probe_selections()
 void
 xclip_handle_SelectionNotify(XSelectionEvent * event)
 {
-	unsigned long nitems, bytes_left;
+	unsigned long i, nitems, bytes_left;
 	XWindowAttributes wa;
 	Atom type;
 	Atom *supported_targets;
-	int res, i, format;
+	int res, format;
 	uint8 *data = NULL;
+	char *selection_name, *target_name, *property_name;
 
 	if (event->property == None)
 		goto fail;
 
+	selection_name = XGetAtomName(g_display, event->selection);
+	target_name = XGetAtomName(g_display, event->target);
+	property_name = XGetAtomName(g_display, event->property);
 	logger(Clipboard, Debug,
 	       "xclip_handle_SelectionNotify(), selection=%s, target=%s, property=%s",
-	       XGetAtomName(g_display, event->selection), XGetAtomName(g_display, event->target),
-	       XGetAtomName(g_display, event->property));
+	       selection_name, target_name, property_name);
+	XFree(selection_name);
+	XFree(target_name);
+	XFree(property_name);
 
 	if (event->target == timestamp_atom)
 	{
@@ -642,9 +661,11 @@ xclip_handle_SelectionNotify(XSelectionEvent * event)
 			supported_targets = (Atom *) data;
 			for (i = 0; i < nitems; i++)
 			{
+				target_name = XGetAtomName(g_display, supported_targets[i]);
 				logger(Clipboard, Debug,
 				       "xclip_handle_SelectionNotify(), target %d: %s", i,
-				       XGetAtomName(g_display, supported_targets[i]));
+				       target_name);
+				XFree(target_name);
 				if (supported_targets[i] == format_string_atom)
 				{
 					if (text_target_satisfaction < 1)
@@ -781,11 +802,17 @@ xclip_handle_SelectionRequest(XSelectionRequestEvent * event)
 	unsigned char *prop_return = NULL;
 	int format, res;
 	Atom type;
+	char *selection_name, *target_name, *property_name;
 
+	selection_name = XGetAtomName(g_display, event->selection);
+	target_name = XGetAtomName(g_display, event->target);
+	property_name = XGetAtomName(g_display, event->property);
 	logger(Clipboard, Debug,
 	       "xclip_handle_SelectionRequest(), selection=%s, target=%s, property=%s",
-	       XGetAtomName(g_display, event->selection), XGetAtomName(g_display, event->target),
-	       XGetAtomName(g_display, event->property));
+	       selection_name, target_name, property_name);
+	XFree(selection_name);
+	XFree(target_name);
+	XFree(property_name);
 
 	if (event->target == targets_atom)
 	{
@@ -855,9 +882,11 @@ xclip_handle_SelectionRequest(XSelectionRequestEvent * event)
 		}
 		else
 		{
+			target_name = XGetAtomName(g_display, event->target);
 			logger(Clipboard, Warning,
 			       "xclip_handle_SelectionRequest(), unsupported target format, target='%s'",
-			       XGetAtomName(g_display, event->target));
+			       target_name);
+			XFree(target_name);
 			xclip_refuse_selection(event);
 			return;
 		}
@@ -873,7 +902,7 @@ xclip_handle_SelectionRequest(XSelectionRequestEvent * event)
    is offered by the RDP server (and when it is pasted inside RDP, there's no network
    roundtrip).
 
-   This event (SelectionClear) symbolizes this rdesktop lost onwership of the clipboard
+   This event (SelectionClear) symbolizes this rdesktop lost ownership of the clipboard
    to some other X client. We should find out what clipboard formats this other
    client offers and announce that to RDP. */
 void
@@ -902,7 +931,7 @@ xclip_handle_PropertyNotify(XPropertyEvent * event)
 
 		while (bytes_left > 0)
 		{
-			/* Unlike the specification, we don't set the 'delete' arugment to True
+			/* Unlike the specification, we don't set the 'delete' argument to True
 			   since we slurp the INCR's chunks in even-smaller chunks of 4096 bytes. */
 			if ((XGetWindowProperty
 			     (g_display, g_wnd, rdesktop_clipboard_target_atom, offset, 4096L,
@@ -967,11 +996,11 @@ ui_clip_format_announce(uint8 * data, uint32 length)
 
 	XSetSelectionOwner(g_display, primary_atom, g_wnd, acquire_time);
 	if (XGetSelectionOwner(g_display, primary_atom) != g_wnd)
-		logger(Clipboard, Warning, "failed to aquire ownership of PRIMARY clipboard");
+		logger(Clipboard, Warning, "failed to acquire ownership of PRIMARY clipboard");
 
 	XSetSelectionOwner(g_display, clipboard_atom, g_wnd, acquire_time);
 	if (XGetSelectionOwner(g_display, clipboard_atom) != g_wnd)
-		logger(Clipboard, Warning, "failed to aquire ownership of CLIPBOARD clipboard");
+		logger(Clipboard, Warning, "failed to acquire ownership of CLIPBOARD clipboard");
 
 	if (formats_data)
 		xfree(formats_data);
@@ -1051,9 +1080,11 @@ ui_clip_handle_data(uint8 * data, uint32 length)
 	}
 	else
 	{
+		char *target_name = XGetAtomName(g_display, selection_request.target);
 		logger(Clipboard, Debug,
 		       "ui_clip_handle_data(), no handler for selection target '%s'",
-		       XGetAtomName(g_display, selection_request.target));
+		       target_name);
+		XFree(target_name);
 		xclip_refuse_selection(&selection_request);
 		has_selection_request = False;
 		return;

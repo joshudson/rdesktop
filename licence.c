@@ -58,7 +58,7 @@ licence_generate_hwid(uint8 * hwid)
 	strncpy((char *) (hwid + 4), g_hostname, LICENCE_HWID_SIZE - 4);
 }
 
-/* Send a lincece info packet to server */
+/* Send a licence info packet to server */
 static void
 licence_info(uint8 * client_random, uint8 * rsa_data,
 	     uint8 * licence_data, int licence_size, uint8 * hwid, uint8 * signature)
@@ -79,24 +79,25 @@ licence_info(uint8 * client_random, uint8 * rsa_data,
 	out_uint16(s, 0);
 	out_uint16_le(s, 0x0201);
 
-	out_uint8p(s, client_random, SEC_RANDOM_SIZE);
+	out_uint8a(s, client_random, SEC_RANDOM_SIZE);
 	out_uint16_le(s, 2);
 	out_uint16_le(s, (SEC_MODULUS_SIZE + SEC_PADDING_SIZE));
-	out_uint8p(s, rsa_data, SEC_MODULUS_SIZE);
+	out_uint8a(s, rsa_data, SEC_MODULUS_SIZE);
 	out_uint8s(s, SEC_PADDING_SIZE);
 
 	out_uint16_le(s, 1);
 	out_uint16_le(s, licence_size);
-	out_uint8p(s, licence_data, licence_size);
+	out_uint8a(s, licence_data, licence_size);
 
 	out_uint16_le(s, 1);
 	out_uint16_le(s, LICENCE_HWID_SIZE);
-	out_uint8p(s, hwid, LICENCE_HWID_SIZE);
+	out_uint8a(s, hwid, LICENCE_HWID_SIZE);
 
-	out_uint8p(s, signature, LICENCE_SIGNATURE_SIZE);
+	out_uint8a(s, signature, LICENCE_SIGNATURE_SIZE);
 
 	s_mark_end(s);
 	sec_send(s, sec_flags);
+	s_free(s);
 }
 
 /* Send a new licence request packet */
@@ -120,24 +121,25 @@ licence_send_new_licence_request(uint8 * client_random, uint8 * rsa_data, char *
 	out_uint16(s, 0);
 	out_uint16_le(s, 0xff01);
 
-	out_uint8p(s, client_random, SEC_RANDOM_SIZE);
+	out_uint8a(s, client_random, SEC_RANDOM_SIZE);
 	out_uint16_le(s, 2);
 	out_uint16_le(s, (SEC_MODULUS_SIZE + SEC_PADDING_SIZE));
-	out_uint8p(s, rsa_data, SEC_MODULUS_SIZE);
+	out_uint8a(s, rsa_data, SEC_MODULUS_SIZE);
 	out_uint8s(s, SEC_PADDING_SIZE);
 
 	/* Username LICENSE_BINARY_BLOB */
 	out_uint16_le(s, BB_CLIENT_USER_NAME_BLOB);
 	out_uint16_le(s, userlen);
-	out_uint8p(s, user, userlen);
+	out_uint8a(s, user, userlen);
 
 	/* Machinename LICENSE_BINARY_BLOB */
 	out_uint16_le(s, BB_CLIENT_MACHINE_NAME_BLOB);
 	out_uint16_le(s, hostlen);
-	out_uint8p(s, host, hostlen);
+	out_uint8a(s, host, hostlen);
 
 	s_mark_end(s);
 	sec_send(s, sec_flags);
+	s_free(s);
 }
 
 /* Process a licence request packet */
@@ -188,9 +190,9 @@ licence_process_request(STREAM s)
 	licence_send_new_licence_request(null_data, null_data, g_username, g_hostname);
 }
 
-/* Send a platform challange response packet */
+/* Send a platform challenge response packet */
 static void
-licence_send_platform_challange_response(uint8 * token, uint8 * crypt_hwid, uint8 * signature)
+licence_send_platform_challenge_response(uint8 * token, uint8 * crypt_hwid, uint8 * signature)
 {
 	uint32 sec_flags = SEC_LICENSE_PKT;
 	uint16 length = 58;
@@ -198,27 +200,28 @@ licence_send_platform_challange_response(uint8 * token, uint8 * crypt_hwid, uint
 
 	s = sec_init(sec_flags, length + 2);
 
-	out_uint8(s, LICENCE_TAG_PLATFORM_CHALLANGE_RESPONSE);
+	out_uint8(s, LICENCE_TAG_PLATFORM_CHALLENGE_RESPONSE);
 	out_uint8(s, ((g_rdp_version >= RDP_V5) ? 3 : 2));	/* version */
 	out_uint16_le(s, length);
 
 	out_uint16_le(s, 1);
 	out_uint16_le(s, LICENCE_TOKEN_SIZE);
-	out_uint8p(s, token, LICENCE_TOKEN_SIZE);
+	out_uint8a(s, token, LICENCE_TOKEN_SIZE);
 
 	out_uint16_le(s, 1);
 	out_uint16_le(s, LICENCE_HWID_SIZE);
-	out_uint8p(s, crypt_hwid, LICENCE_HWID_SIZE);
+	out_uint8a(s, crypt_hwid, LICENCE_HWID_SIZE);
 
-	out_uint8p(s, signature, LICENCE_SIGNATURE_SIZE);
+	out_uint8a(s, signature, LICENCE_SIGNATURE_SIZE);
 
 	s_mark_end(s);
 	sec_send(s, sec_flags);
+	s_free(s);
 }
 
-/* Parse an platform challange request packet */
+/* Parse an platform challenge request packet */
 static RD_BOOL
-licence_parse_platform_challange(STREAM s, uint8 ** token, uint8 ** signature)
+licence_parse_platform_challenge(STREAM s, uint8 ** token, uint8 ** signature)
 {
 	uint16 tokenlen;
 
@@ -238,9 +241,9 @@ licence_parse_platform_challange(STREAM s, uint8 ** token, uint8 ** signature)
 	return s_check_end(s);
 }
 
-/* Process a platform challange  packet */
+/* Process a platform challenge  packet */
 static void
-licence_process_platform_challange(STREAM s)
+licence_process_platform_challenge(STREAM s)
 {
 	uint8 *in_token = NULL, *in_sig;
 	uint8 out_token[LICENCE_TOKEN_SIZE], decrypt_token[LICENCE_TOKEN_SIZE];
@@ -250,7 +253,7 @@ licence_process_platform_challange(STREAM s)
 	RDSSL_RC4 crypt_key;
 
 	/* Parse incoming packet and save the encrypted token */
-	licence_parse_platform_challange(s, &in_token, &in_sig);
+	licence_parse_platform_challenge(s, &in_token, &in_sig);
 	memcpy(out_token, in_token, LICENCE_TOKEN_SIZE);
 
 	/* Decrypt the token. It should read TEST in Unicode. */
@@ -267,13 +270,14 @@ licence_process_platform_challange(STREAM s)
 	rdssl_rc4_set_key(&crypt_key, g_licence_key, 16);
 	rdssl_rc4_crypt(&crypt_key, hwid, crypt_hwid, LICENCE_HWID_SIZE);
 
-	licence_send_platform_challange_response(out_token, crypt_hwid, out_sig);
+	licence_send_platform_challenge_response(out_token, crypt_hwid, out_sig);
 }
 
 /* Process a new licence packet */
 static void
 licence_process_new_license(STREAM s)
 {
+	unsigned char *data;
 	RDSSL_RC4 crypt_key;
 	uint32 length;
 	int i;
@@ -283,8 +287,12 @@ licence_process_new_license(STREAM s)
 	if (!s_check_rem(s, length))
 		return;
 
+	inout_uint8p(s, data, length);
+
 	rdssl_rc4_set_key(&crypt_key, g_licence_key, 16);
-	rdssl_rc4_crypt(&crypt_key, s->p, s->p, length);
+	rdssl_rc4_crypt(&crypt_key, data, data, length);
+
+	s_seek(s, s_tell(s) - length);
 
 	/* Parse NEW_LICENSE_INFO block */
 	in_uint8s(s, 4);	// skip dwVersion
@@ -301,7 +309,8 @@ licence_process_new_license(STREAM s)
 	}
 
 	g_licence_issued = True;
-	save_licence(s->p, length);
+	in_uint8p(s, data, length);
+	save_licence(data, length);
 }
 
 /* process a licence error alert packet */
@@ -313,7 +322,7 @@ licence_process_error_alert(STREAM s)
 
 	in_uint32(s, error_code);
 	in_uint32(s, state_transition);
-	in_uint8s(s, 4);                     /* Skip error_info */
+	in_uint8s(s, 4);	/* Skip error_info */
 
 	/* There is a special case in the error alert handling, when licensing is all good
 	   and the server is not sending a license to client, a "Server License Error PDU -
@@ -327,7 +336,7 @@ licence_process_error_alert(STREAM s)
 		return;
 	}
 
-	/* handle error codes, for now, jsut report them */
+	/* handle error codes, for now, just report them */
 	switch (error_code)
 	{
 		case 0x6:	// ERR_NO_LICENSE_SERVER
@@ -370,8 +379,8 @@ licence_process(STREAM s)
 			licence_process_request(s);
 			break;
 
-		case LICENCE_TAG_PLATFORM_CHALLANGE:
-			licence_process_platform_challange(s);
+		case LICENCE_TAG_PLATFORM_CHALLENGE:
+			licence_process_platform_challenge(s);
 			break;
 
 		case LICENCE_TAG_NEW_LICENCE:

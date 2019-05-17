@@ -56,6 +56,7 @@ seamless_get_token(char **s)
 static RD_BOOL
 seamless_process_line(const char *line, void *data)
 {
+	UNUSED(data);
 	char *p, *l;
 	char *tok1, *tok3, *tok4, *tok5, *tok6, *tok7, *tok8;
 	unsigned long id, flags;
@@ -67,7 +68,7 @@ seamless_process_line(const char *line, void *data)
 	logger(Core, Debug, "seamless_process_line(), got '%s'", p);
 
 	tok1 = seamless_get_token(&p);
-	(void)seamless_get_token(&p);
+	(void) seamless_get_token(&p);
 	tok3 = seamless_get_token(&p);
 	tok4 = seamless_get_token(&p);
 	tok5 = seamless_get_token(&p);
@@ -167,6 +168,12 @@ seamless_process_line(const char *line, void *data)
 
 			icon_buf[len] = strtol(byte, NULL, 16);
 			len++;
+
+			if ((size_t)len >= sizeof(icon_buf))
+			{
+				logger(Protocol, Warning, "seamless_process_line(), icon data would overrun icon_buf");
+				break;
+			}
 		}
 
 		ui_seamless_seticon(id, tok5, width, height, chunk, icon_buf, len);
@@ -358,7 +365,7 @@ seamless_line_handler(const char *line, void *data)
 {
 	if (!seamless_process_line(line, data))
 	{
-		logger(Core, Warning, "seamless_line_handler(), invlid request '%s'", line);
+		logger(Core, Warning, "seamless_line_handler(), invalid request '%s'", line);
 	}
 	return True;
 }
@@ -370,10 +377,11 @@ seamless_process(STREAM s)
 	unsigned int pkglen;
 	char *buf;
 
-	pkglen = s->end - s->p;
+	pkglen = s_remaining(s);
 	/* str_handle_lines requires null terminated strings */
 	buf = xmalloc(pkglen + 1);
-	STRNCPY(buf, (char *) s->p, pkglen + 1);
+	in_uint8a(s, buf, pkglen);
+	buf[pkglen] = '\0';
 	str_handle_lines(buf, &seamless_rest, seamless_line_handler, NULL);
 
 	xfree(buf);
@@ -433,11 +441,12 @@ seamless_send(const char *command, const char *format, ...)
 	len++;
 
 	s = channel_init(seamless_channel, len);
-	out_uint8p(s, buf, len) s_mark_end(s);
+	out_uint8a(s, buf, len) s_mark_end(s);
 
 	logger(Core, Debug, "seamless_send(), sending '%s'", buf);
 
 	channel_send(s, seamless_channel);
+	s_free(s);
 
 	return seamless_serial++;
 }

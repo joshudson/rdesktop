@@ -92,14 +92,14 @@
 /* SERIAL_WAIT_ON_MASK */
 #define SERIAL_EV_RXCHAR           0x0001	/* Any Character received */
 #define SERIAL_EV_RXFLAG           0x0002	/* Received certain character */
-#define SERIAL_EV_TXEMPTY          0x0004	/* Transmitt Queue Empty */
+#define SERIAL_EV_TXEMPTY          0x0004	/* Transmit Queue Empty */
 #define SERIAL_EV_CTS              0x0008	/* CTS changed state */
 #define SERIAL_EV_DSR              0x0010	/* DSR changed state */
 #define SERIAL_EV_RLSD             0x0020	/* RLSD changed state */
 #define SERIAL_EV_BREAK            0x0040	/* BREAK received */
 #define SERIAL_EV_ERR              0x0080	/* Line status error occurred */
 #define SERIAL_EV_RING             0x0100	/* Ring signal detected */
-#define SERIAL_EV_PERR             0x0200	/* Printer error occured */
+#define SERIAL_EV_PERR             0x0200	/* Printer error occurred */
 #define SERIAL_EV_RX80FULL         0x0400	/* Receive buffer is 80 percent full */
 #define SERIAL_EV_EVENT1           0x0800	/* Provider specific event 1 */
 #define SERIAL_EV_EVENT2           0x1000	/* Provider specific event 2 */
@@ -502,7 +502,7 @@ set_termios(SERIAL_DEVICE * pser_inf, RD_NTHANDLE serial_fd)
 }
 
 /* Enumeration of devices from rdesktop.c        */
-/* returns numer of units found and initialized. */
+/* returns number of units found and initialized. */
 /* optarg looks like ':com1=/dev/ttyS0'           */
 /* when it arrives to this function.              */
 /* :com1=/dev/ttyS0,com2=/dev/ttyS1 */
@@ -552,12 +552,17 @@ static RD_NTSTATUS
 serial_create(uint32 device_id, uint32 access, uint32 share_mode, uint32 disposition,
 	      uint32 flags_and_attributes, char *filename, RD_NTHANDLE * handle)
 {
-	RD_NTHANDLE serial_fd;
+	UNUSED(access);
+	UNUSED(share_mode);
+	UNUSED(disposition);
+	UNUSED(flags_and_attributes);
+	UNUSED(filename);
+	int serial_fd;
 	SERIAL_DEVICE *pser_inf;
 
 	pser_inf = (SERIAL_DEVICE *) g_rdpdr_device[device_id].pdevice_data;
-	serial_fd = open(g_rdpdr_device[device_id].local_path, O_RDWR | O_NOCTTY | O_NONBLOCK);
 
+	serial_fd = open(g_rdpdr_device[device_id].local_path, O_RDWR | O_NOCTTY | O_NONBLOCK);
 	if (serial_fd == -1)
 	{
 		logger(Core, Error, "serial_create(), open '%s' failed: %s",
@@ -623,8 +628,9 @@ serial_close(RD_NTHANDLE handle)
 }
 
 static RD_NTSTATUS
-serial_read(RD_NTHANDLE handle, uint8 * data, uint32 length, uint32 offset, uint32 * result)
+serial_read(RD_NTHANDLE handle, uint8 * data, uint32 length, uint64 offset, uint32 * result)
 {
+	UNUSED(offset);  /* Offset must always be zero according to MS-RDPESP */
 	long timeout;
 	SERIAL_DEVICE *pser_inf;
 	struct termios *ptermios;
@@ -678,11 +684,10 @@ serial_read(RD_NTHANDLE handle, uint8 * data, uint32 length, uint32 offset, uint
 }
 
 static RD_NTSTATUS
-serial_write(RD_NTHANDLE handle, uint8 * data, uint32 length, uint32 offset, uint32 * result)
+serial_write(RD_NTHANDLE handle, uint8 * data, uint32 length, uint64 offset, uint32 * result)
 {
+	UNUSED(offset);  /* Offset must always be zero according to MS-RDPESP */
 	SERIAL_DEVICE *pser_inf;
-
-	/* FIXME: offset is not used ? */
 
 	pser_inf = get_serial_info(handle);
 
@@ -1050,7 +1055,7 @@ serial_get_event(RD_NTHANDLE handle, uint32 * result)
 	return ret;
 }
 
-/* Read timeout for a given file descripter (device) when adding fd's to select() */
+/* Read timeout for a given file descriptor (device) when adding FDs to select() */
 RD_BOOL
 serial_get_timeout(RD_NTHANDLE handle, uint32 length, uint32 * timeout, uint32 * itv_timeout)
 {

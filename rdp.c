@@ -3,7 +3,8 @@
    Protocol services - RDP layer
    Copyright (C) Matthew Chapman <matthewc.unsw.edu.au> 1999-2008
    Copyright 2003-2011 Peter Astrand <astrand@cendio.se> for Cendio AB
-   Copyright 2011-2017 Henrik Andersson <hean01@cendio.se> for Cendio AB
+   Copyright 2011-2018 Henrik Andersson <hean01@cendio.se> for Cendio AB
+   Copyright 2016 Alexander Zakharov <uglym8gmail.com>
    Copyright 2017 Karl Mikaelsson <derfian@cendio.se> for Cendio AB
 
    This program is free software: you can redistribute it and/or modify
@@ -43,18 +44,27 @@ extern RDP_VERSION g_rdp_version;
 extern uint16 g_server_rdp_version;
 extern uint32 g_rdp5_performanceflags;
 extern int g_server_depth;
-extern int g_width;
-extern int g_height;
+extern uint32 g_requested_session_width;
+extern uint32 g_requested_session_height;
 extern RD_BOOL g_bitmap_cache;
 extern RD_BOOL g_bitmap_cache_persist_enable;
 extern RD_BOOL g_numlock_sync;
 extern RD_BOOL g_pending_resize;
+extern RD_BOOL g_pending_resize_defer;
+extern struct timeval g_pending_resize_defer_timer;
 extern RD_BOOL g_network_error;
+extern time_t g_wait_for_deactivate_ts;
 
-uint8 *g_next_packet;
+extern RD_BOOL g_dynamic_session_resize;
+
+RD_BOOL g_exit_mainloop = False;
+
+size_t g_next_packet;
 uint32 g_rdp_shareid;
 
 extern RDPCOMP g_mppc_dict;
+
+extern uint32 vc_chunk_size;
 
 /* Session Directory support */
 extern RD_BOOL g_redirect;
@@ -80,57 +90,102 @@ extern RD_BOOL g_has_reconnect_random;
 extern uint8 g_client_random[SEC_RANDOM_SIZE];
 static uint32 g_packetno;
 
+extern RD_BOOL g_fullscreen;
+
+/* holds the actual session size reported by server */
+uint16 g_session_width;
+uint16 g_session_height;
+
 static void rdp_out_unistr(STREAM s, char *string, int len);
+
+/* reads a TS_SHARECONTROLHEADER from stream, returns True of there is
+   a PDU available otherwise False */
+static RD_BOOL
+rdp_ts_in_share_control_header(STREAM s, uint8 * type, uint16 * length)
+{
+	uint16 pdu_type;
+	uint16 pdu_source;
+
+	UNUSED(pdu_source);
+
+	in_uint16_le(s, *length);	/* totalLength */
+
+	/* If the totalLength field equals 0x8000, then the Share
+	   Control Header and any data that follows MAY be interpreted
+	   as a T.128 FlowPDU as described in [T128] section 8.5 (the
+	   ASN.1 structure definition is detailed in [T128] section
+	   9.1) and MUST be ignored.
+	 */
+	if (*length == 0x8000)
+	{
+		/* skip over this message in stream */
+		g_next_packet += 8;
+		return False;
+	}
+
+	in_uint16_le(s, pdu_type);	/* pduType */
+	in_uint16(s, pdu_source);	/* pduSource */
+
+	*type = pdu_type & 0xf;
+
+	/* Give just the size of the data */
+	*length -= 6;
+
+	return True;
+}
 
 /* Receive an RDP packet */
 static STREAM
 rdp_recv(uint8 * type)
 {
+	RD_BOOL is_fastpath;
 	static STREAM rdp_s;
-	uint16 length, pdu_type;
-	uint8 rdpver;
+	uint16 length;
 
-	if ((rdp_s == NULL) || (g_next_packet >= rdp_s->end) || (g_next_packet == NULL))
+	while (1)
 	{
-		rdp_s = sec_recv(&rdpver);
-		if (rdp_s == NULL)
-			return NULL;
-		if (rdpver == 0xff)
+		/* fill stream with data if needed for parsing a new packet */
+		if (g_next_packet == 0)
 		{
-			g_next_packet = rdp_s->end;
-			*type = 0;
-			return rdp_s;
+			rdp_s = sec_recv(&is_fastpath);
+			if (rdp_s == NULL)
+				return NULL;
+
+			if (is_fastpath == True)
+			{
+				/* process_ts_fp_updates moves g_next_packet */
+				process_ts_fp_updates(rdp_s);
+				continue;
+			}
+
+			g_next_packet = s_tell(rdp_s);
 		}
-		else if (rdpver != 3)
+		else
 		{
-			/* process_ts_fp_updates moves g_next_packet */
-			process_ts_fp_updates(rdp_s);
-			*type = 0;
-			return rdp_s;
+			s_seek(rdp_s, g_next_packet);
+			if (s_check_end(rdp_s))
+			{
+				g_next_packet = 0;
+				continue;
+			}
 		}
 
-		g_next_packet = rdp_s->p;
-	}
-	else
-	{
-		rdp_s->p = g_next_packet;
-	}
+		/* parse a TS_SHARECONTROLHEADER */
+		if (rdp_ts_in_share_control_header(rdp_s, type, &length) == False)
+			continue;
 
-	in_uint16_le(rdp_s, length);
-	/* 32k packets are really 8, keepalive fix */
-	if (length == 0x8000)
-	{
-		g_next_packet += 8;
-		*type = 0;
-		return rdp_s;
+		break;
 	}
-	in_uint16_le(rdp_s, pdu_type);
-	in_uint8s(rdp_s, 2);	/* userid */
-	*type = pdu_type & 0xf;
 
 	logger(Protocol, Debug, "rdp_recv(), RDP packet #%d, type 0x%x", ++g_packetno, *type);
 
-	g_next_packet += length;
+	if (!s_check_rem(rdp_s, length))
+	{
+		rdp_protocol_error("not enough data for PDU", rdp_s);
+	}
+
+	g_next_packet = s_tell(rdp_s) + length;
+
 	return rdp_s;
 }
 
@@ -153,7 +208,7 @@ rdp_send_data(STREAM s, uint8 data_pdu_type)
 	uint16 length;
 
 	s_pop_layer(s, rdp_hdr);
-	length = s->end - s->p;
+	length = s_remaining(s);
 
 	out_uint16_le(s, length);
 	out_uint16_le(s, (RDP_PDU_DATA | 0x10));
@@ -200,7 +255,8 @@ rdp_out_unistr(STREAM s, char *string, int len)
 	 */
 	static iconv_t icv_local_to_utf16;
 	size_t ibl, obl;
-	char *pin, *pout;
+	char *pin;
+	unsigned char *pout;
 
 
 	if (string == NULL || len == 0)
@@ -222,18 +278,16 @@ rdp_out_unistr(STREAM s, char *string, int len)
 	ibl = strlen(string);
 	obl = len + 2;
 	pin = string;
-	pout = (char *) s->p;
+	out_uint8p(s, pout, len + 2);
 
-	memset(pout, 0, len + 4);
+	memset(pout, 0, len + 2);
 
 
-	if (iconv(icv_local_to_utf16, (char **) &pin, &ibl, &pout, &obl) == (size_t) - 1)
+	if (iconv(icv_local_to_utf16, (char **) &pin, &ibl, (char **)&pout, &obl) == (size_t) - 1)
 	{
 		logger(Protocol, Error, "rdp_out_unistr(), iconv(2) fail, errno %d", errno);
 		abort();
 	}
-
-	s->p += len + 2;
 }
 
 /* Input a string in Unicode
@@ -245,7 +299,32 @@ rdp_in_unistr(STREAM s, int in_len, char **string, uint32 * str_size)
 {
 	static iconv_t icv_utf16_to_local;
 	size_t ibl, obl;
-	char *pin, *pout;
+	unsigned char *pin;
+	char *pout;
+
+	struct stream packet = *s;
+
+	if ((in_len < 0) || ((uint32)in_len >= (RD_UINT32_MAX / 2)))
+	{
+		logger(Protocol, Error, "rdp_in_unistr(), length of unicode data is out of bounds.");
+		abort();
+	}
+
+	/* Corner case. We still want to return a null terminated string... */
+	if (in_len == 0) {
+		if (*string == NULL)
+		{
+			*string = xmalloc(1);
+		}
+		**string = '\0';
+		*str_size = 0;
+		return;
+	}
+
+	if (!s_check_rem(s, in_len))
+	{
+		rdp_protocol_error("consume of unicode data from stream would overrun", &packet);
+	}
 
 	// if not already open
 	if (!icv_utf16_to_local)
@@ -269,7 +348,7 @@ rdp_in_unistr(STREAM s, int in_len, char **string, uint32 * str_size)
 
 	ibl = in_len;
 	obl = *str_size - 1;
-	pin = (char *) s->p;
+	in_uint8p(s, pin, in_len);
 	pout = *string;
 
 	if (iconv(icv_utf16_to_local, (char **) &pin, &ibl, &pout, &obl) == (size_t) - 1)
@@ -290,9 +369,7 @@ rdp_in_unistr(STREAM s, int in_len, char **string, uint32 * str_size)
 		abort();
 	}
 
-	/* we must update the location of the current STREAM for future reads of s->p */
-	s->p += in_len;
-
+	/* Always force the last byte to be a null */
 	*pout = 0;
 
 	if (*string)
@@ -300,10 +377,10 @@ rdp_in_unistr(STREAM s, int in_len, char **string, uint32 * str_size)
 }
 
 
-/* Parse a logon info packet */
+/* Send a Client Info PDU */
 static void
-rdp_send_logon_info(uint32 flags, char *domain, char *user,
-		    char *password, char *program, char *directory)
+rdp_send_client_info_pdu(uint32 flags, char *domain, char *user,
+			 char *password, char *program, char *directory)
 {
 	char *ipaddr = tcp_get_address();
 	/* length of string in TS_INFO_PACKET excludes null terminator */
@@ -352,9 +429,10 @@ rdp_send_logon_info(uint32 flags, char *domain, char *user,
 
 		if (g_redirect == True && g_redirect_cookie_len > 0)
 		{
+			flags &= ~RDP_INFO_PASSWORD_IS_SC_PIN;
 			flags |= RDP_INFO_AUTOLOGON;
 			len_password = g_redirect_cookie_len;
-			len_password -= 2;	/* substract 2 bytes which is added below */
+			len_password -= 2;	/* subtract 2 bytes which is added below */
 			logger(Protocol, Debug,
 			       "rdp_send_logon_info(), Using %d bytes redirect cookie as password",
 			       g_redirect_cookie_len);
@@ -375,8 +453,8 @@ rdp_send_logon_info(uint32 flags, char *domain, char *user,
 			2 + len_program +	/* AlternateShell */
 			2 + len_directory +	/* WorkingDir */
 			/* size of TS_EXTENDED_INFO_PACKET */
-			2 +	/* clientAdressFamily */
-			2 +	/* cbClientAdress */
+			2 +	/* clientAddressFamily */
+			2 +	/* cbClientAddress */
 			len_ip +	/* clientAddress */
 			2 +	/* cbClientDir */
 			len_dll +	/* clientDir */
@@ -414,7 +492,7 @@ rdp_send_logon_info(uint32 flags, char *domain, char *user,
 
 		if (g_redirect == True && 0 < g_redirect_cookie_len)
 		{
-			out_uint8p(s, g_redirect_cookie, g_redirect_cookie_len);
+			out_uint8a(s, g_redirect_cookie, g_redirect_cookie_len);
 		}
 		else
 		{
@@ -457,6 +535,8 @@ rdp_send_logon_info(uint32 flags, char *domain, char *user,
 		/* Client Auto-Reconnect */
 		if (g_has_reconnect_random)
 		{
+			logger(Protocol, Debug,
+			       "rdp_send_logon_info(), Sending auto-reconnect cookie.");
 			out_uint16_le(s, 28);	/* cbAutoReconnectLen */
 			/* ARC_CS_PRIVATE_PACKET */
 			out_uint32_le(s, 28);	/* cbLen */
@@ -478,6 +558,7 @@ rdp_send_logon_info(uint32 flags, char *domain, char *user,
 	g_redirect = False;
 
 	sec_send(s, sec_flags);
+	s_free(s);
 }
 
 /* Send a control PDU */
@@ -494,6 +575,7 @@ rdp_send_control(uint16 action)
 
 	s_mark_end(s);
 	rdp_send_data(s, RDP_DATA_PDU_CONTROL);
+	s_free(s);
 }
 
 /* Send a synchronisation PDU */
@@ -502,6 +584,8 @@ rdp_send_synchronise(void)
 {
 	STREAM s;
 
+	logger(Protocol, Debug, "%s()", __func__);
+
 	s = rdp_init_data(4);
 
 	out_uint16_le(s, 1);	/* type */
@@ -509,6 +593,7 @@ rdp_send_synchronise(void)
 
 	s_mark_end(s);
 	rdp_send_data(s, RDP_DATA_PDU_SYNCHRONISE);
+	s_free(s);
 }
 
 /* Send a single input event */
@@ -516,6 +601,8 @@ void
 rdp_send_input(uint32 time, uint16 message_type, uint16 device_flags, uint16 param1, uint16 param2)
 {
 	STREAM s;
+
+	logger(Protocol, Debug, "%s()", __func__);
 
 	s = rdp_init_data(16);
 
@@ -530,46 +617,54 @@ rdp_send_input(uint32 time, uint16 message_type, uint16 device_flags, uint16 par
 
 	s_mark_end(s);
 	rdp_send_data(s, RDP_DATA_PDU_INPUT);
+	s_free(s);
 }
 
-/* Send a client window information PDU */
+/* Send a Suppress Output PDU */
 void
-rdp_send_client_window_status(int status)
+rdp_send_suppress_output_pdu(enum RDP_SUPPRESS_STATUS allowupdates)
 {
 	STREAM s;
-	static int current_status = 1;
+	static enum RDP_SUPPRESS_STATUS current_status = ALLOW_DISPLAY_UPDATES;
 
-	if (current_status == status)
+	logger(Protocol, Debug, "%s()", __func__);
+
+	if (current_status == allowupdates)
 		return;
 
 	s = rdp_init_data(12);
 
-	out_uint32_le(s, status);
+	out_uint8(s, allowupdates);	/* allowDisplayUpdates */
+	out_uint8s(s, 3);	/* pad3Octets */
 
-	switch (status)
+	switch (allowupdates)
 	{
-		case 0:	/* shut the server up */
+		case SUPPRESS_DISPLAY_UPDATES:	/* shut the server up */
 			break;
 
-		case 1:	/* receive data again */
-			out_uint32_le(s, 0);	/* unknown */
-			out_uint16_le(s, g_width);
-			out_uint16_le(s, g_height);
+		case ALLOW_DISPLAY_UPDATES:	/* receive data again */
+			out_uint16_le(s, 0);	/* left */
+			out_uint16_le(s, 0);	/* top */
+			out_uint16_le(s, g_session_width);	/* right */
+			out_uint16_le(s, g_session_height);	/* bottom */
 			break;
 	}
 
 	s_mark_end(s);
 	rdp_send_data(s, RDP_DATA_PDU_CLIENT_WINDOW_STATUS);
-	current_status = status;
+	s_free(s);
+	current_status = allowupdates;
 }
 
-/* Send persistent bitmap cache enumeration PDU's */
+/* Send persistent bitmap cache enumeration PDUs */
 static void
 rdp_enum_bmpcache2(void)
 {
 	STREAM s;
 	HASH_KEY keylist[BMPCACHE2_NUM_PSTCELLS];
 	uint32 num_keys, offset, count, flags;
+
+	logger(Protocol, Debug, "%s()", __func__);
 
 	offset = 0;
 	num_keys = pstcache_enumerate(2, keylist);
@@ -602,6 +697,7 @@ rdp_enum_bmpcache2(void)
 
 		s_mark_end(s);
 		rdp_send_data(s, 0x2b);
+		s_free(s);
 
 		offset += 169;
 	}
@@ -613,6 +709,8 @@ rdp_send_fonts(uint16 seq)
 {
 	STREAM s;
 
+	logger(Protocol, Debug, "%s()", __func__);
+
 	s = rdp_init_data(8);
 
 	out_uint16(s, 0);	/* number of fonts */
@@ -622,6 +720,7 @@ rdp_send_fonts(uint16 seq)
 
 	s_mark_end(s);
 	rdp_send_data(s, RDP_DATA_PDU_FONT2);
+	s_free(s);
 }
 
 /* Output general capability set (TS_GENERAL_CAPABILITYSET) */
@@ -639,38 +738,40 @@ rdp_out_ts_general_capabilityset(STREAM s)
 
 	out_uint16_le(s, RDP_CAPSET_GENERAL);
 	out_uint16_le(s, RDP_CAPLEN_GENERAL);
-	out_uint16_le(s, OSMAJORTYPE_WINDOWS);		/* osMajorType */
+	out_uint16_le(s, OSMAJORTYPE_WINDOWS);	/* osMajorType */
 	out_uint16_le(s, OSMINORTYPE_WINDOWSNT);	/* osMinorType */
 	out_uint16_le(s, TS_CAPS_PROTOCOLVERSION);	/* protocolVersion (must be TS_CAPS_PROTOCOLVERSION) */
-	out_uint16_le(s, 0);				/* pad2OctetsA */
-	out_uint16_le(s, 0);				/* generalCompressionTypes (must be 0) */
-	out_uint16_le(s, extraFlags);			/* extraFlags */
-	out_uint16_le(s, 0);				/* updateCapabilityFlag (must be 0) */
-	out_uint16_le(s, 0);				/* remoteUnshareFlag (must be 0) */
-	out_uint16_le(s, 0);				/* generalCompressionLevel (must be 0) */
-	out_uint8(s, 0);				/* refreshRectSupport */
-	out_uint8(s, 0);				/* suppressOutputSupport */
+	out_uint16_le(s, 0);	/* pad2OctetsA */
+	out_uint16_le(s, 0);	/* generalCompressionTypes (must be 0) */
+	out_uint16_le(s, extraFlags);	/* extraFlags */
+	out_uint16_le(s, 0);	/* updateCapabilityFlag (must be 0) */
+	out_uint16_le(s, 0);	/* remoteUnshareFlag (must be 0) */
+	out_uint16_le(s, 0);	/* generalCompressionLevel (must be 0) */
+	out_uint8(s, 0);	/* refreshRectSupport */
+	out_uint8(s, 0);	/* suppressOutputSupport */
 }
 
 /* Output bitmap capability set */
 static void
 rdp_out_ts_bitmap_capabilityset(STREAM s)
 {
+	logger(Protocol, Debug, "rdp_out_ts_bitmap_capabilityset(), %dx%d",
+	       g_session_width, g_session_height);
 	out_uint16_le(s, RDP_CAPSET_BITMAP);
 	out_uint16_le(s, RDP_CAPLEN_BITMAP);
 	out_uint16_le(s, g_server_depth);	/* preferredBitsPerPixel */
-	out_uint16_le(s, 1);			/* receive1BitPerPixel (ignored, should be 1) */
-	out_uint16_le(s, 1);			/* receive4BitPerPixel (ignored, should be 1) */
-	out_uint16_le(s, 1);			/* receive8BitPerPixel (ignored, should be 1) */
-	out_uint16_le(s, 800);			/* desktopWidth */
-	out_uint16_le(s, 600);			/* desktopHeight */
-	out_uint16_le(s, 0);			/* pad2Octets */
-	out_uint16_le(s, 1);			/* desktopResizeFlag */
-	out_uint16_le(s, 1);			/* bitmapCompressionFlag (must be 1) */
-	out_uint8(s, 0);			/* highColorFlags (ignored, should be 0) */
-	out_uint8(s, 0);			/* drawingFlags */
-	out_uint16_le(s, 1);			/* multipleRectangleSupport (must be 1) */
-	out_uint16_le(s, 0);			/* pad2OctetsB */
+	out_uint16_le(s, 1);	/* receive1BitPerPixel (ignored, should be 1) */
+	out_uint16_le(s, 1);	/* receive4BitPerPixel (ignored, should be 1) */
+	out_uint16_le(s, 1);	/* receive8BitPerPixel (ignored, should be 1) */
+	out_uint16_le(s, g_session_width);	/* desktopWidth */
+	out_uint16_le(s, g_session_height);	/* desktopHeight */
+	out_uint16_le(s, 0);	/* pad2Octets */
+	out_uint16_le(s, 1);	/* desktopResizeFlag */
+	out_uint16_le(s, 1);	/* bitmapCompressionFlag (must be 1) */
+	out_uint8(s, 0);	/* highColorFlags (ignored, should be 0) */
+	out_uint8(s, 0);	/* drawingFlags */
+	out_uint16_le(s, 1);	/* multipleRectangleSupport (must be 1) */
+	out_uint16_le(s, 0);	/* pad2OctetsB */
 }
 
 /* Output order capability set */
@@ -681,7 +782,7 @@ rdp_out_ts_order_capabilityset(STREAM s)
 	uint16 orderflags = 0;
 	uint32 cachesize = 0;
 
-	orderflags |= (NEGOTIATEORDERSUPPORT | ZEROBOUNDSDELTASSUPPORT); /* mandatory flags */
+	orderflags |= (NEGOTIATEORDERSUPPORT | ZEROBOUNDSDELTASSUPPORT);	/* mandatory flags */
 	orderflags |= COLORINDEXSUPPORT;
 
 	memset(order_caps, 0, 32);
@@ -713,23 +814,23 @@ rdp_out_ts_order_capabilityset(STREAM s)
 
 	out_uint16_le(s, RDP_CAPSET_ORDER);
 	out_uint16_le(s, RDP_CAPLEN_ORDER);
-	out_uint8s(s, 16);		/* terminalDescriptor (ignored, should be 0) */
-	out_uint8s(s, 4);		/* pad4OctetsA */
-	out_uint16_le(s, 1);		/* desktopSaveXGranularity (ignored, assumed to be 1) */
-	out_uint16_le(s, 20);		/* desktopSaveYGranularity (ignored, assumed to be 20) */
-	out_uint16_le(s, 0);		/* Pad */
-	out_uint16_le(s, 1);		/* maximumOrderLevel (ignored, should be 1) */
-	out_uint16_le(s, 0);		/* numberFonts (ignored, should be 0) */
+	out_uint8s(s, 16);	/* terminalDescriptor (ignored, should be 0) */
+	out_uint8s(s, 4);	/* pad4OctetsA */
+	out_uint16_le(s, 1);	/* desktopSaveXGranularity (ignored, assumed to be 1) */
+	out_uint16_le(s, 20);	/* desktopSaveYGranularity (ignored, assumed to be 20) */
+	out_uint16_le(s, 0);	/* Pad */
+	out_uint16_le(s, 1);	/* maximumOrderLevel (ignored, should be 1) */
+	out_uint16_le(s, 0);	/* numberFonts (ignored, should be 0) */
 	out_uint16_le(s, orderflags);	/* orderFlags */
-	out_uint8p(s, order_caps, 32);	/* orderSupport */
-	out_uint16_le(s, 0);		/* textFlags (ignored) */
-	out_uint16_le(s, 0);    	/* orderSupportExFlags */
-	out_uint32_le(s, 0);		/* pad4OctetsB */
+	out_uint8a(s, order_caps, 32);	/* orderSupport */
+	out_uint16_le(s, 0);	/* textFlags (ignored) */
+	out_uint16_le(s, 0);	/* orderSupportExFlags */
+	out_uint32_le(s, 0);	/* pad4OctetsB */
 	out_uint32_le(s, cachesize);	/* desktopSaveSize */
-	out_uint16_le(s, 0);		/* pad2OctetsC */
-	out_uint16_le(s, 0);		/* pad2OctetsD */
-	out_uint16_le(s, 1252);		/* textANSICodePage */
-	out_uint16_le(s, 0);		/* pad2OctetsE */
+	out_uint16_le(s, 0);	/* pad2OctetsC */
+	out_uint16_le(s, 0);	/* pad2OctetsD */
+	out_uint16_le(s, 1252);	/* textANSICodePage */
+	out_uint16_le(s, 0);	/* pad2OctetsE */
 }
 
 /* Output bitmap cache capability set */
@@ -737,6 +838,9 @@ static void
 rdp_out_bmpcache_caps(STREAM s)
 {
 	int Bpp;
+
+	logger(Protocol, Debug, "%s()", __func__);
+
 	out_uint16_le(s, RDP_CAPSET_BMPCACHE);
 	out_uint16_le(s, RDP_CAPLEN_BMPCACHE);
 
@@ -855,6 +959,29 @@ rdp_out_brushcache_caps(STREAM s)
 	out_uint32_le(s, 1);	/* cache type */
 }
 
+/* 2.2.7.1.10 MS-RDPBCGR */
+/* Output virtual channel capability set */
+static void
+rdp_out_virtchan_caps(STREAM s)
+{
+	out_uint16_le(s, RDP_CAPSET_VC);
+	out_uint16_le(s, RDP_CAPLEN_VC);
+	/* VCCAPS_COMPR_SC */
+	out_uint32_le(s, 0x00000001);	/* compression flags */
+}
+
+static void
+rdp_process_virtchan_caps(STREAM s)
+{
+	uint32 flags, chunk_size;
+
+	in_uint32_le(s, flags);
+	in_uint32_le(s, chunk_size);
+
+	UNUSED(flags);
+	vc_chunk_size = chunk_size;
+}
+
 /* Output Input Capability Set */
 static void
 rdp_out_ts_input_capabilityset(STREAM s)
@@ -865,12 +992,12 @@ rdp_out_ts_input_capabilityset(STREAM s)
 	out_uint16_le(s, RDP_CAPSET_INPUT);
 	out_uint16_le(s, RDP_CAPLEN_INPUT);
 
-	out_uint16_le(s, inputflags);		/* inputFlags */
-	out_uint16_le(s, 0);			/* pad2OctetsA */
-	out_uint32_le(s, 0x409);		/* keyboardLayout */
-	out_uint32_le(s, 0x4);			/* keyboardType */
-	out_uint32_le(s, 0);			/* keyboardSubtype */
-	out_uint32_le(s, 0xC);			/* keyboardFunctionKey */
+	out_uint16_le(s, inputflags);	/* inputFlags */
+	out_uint16_le(s, 0);	/* pad2OctetsA */
+	out_uint32_le(s, 0x409);	/* keyboardLayout */
+	out_uint32_le(s, 0x4);	/* keyboardType */
+	out_uint32_le(s, 0);	/* keyboardSubtype */
+	out_uint32_le(s, 0xC);	/* keyboardFunctionKey */
 	out_utf16s_padded(s, "", 64, 0);	/* imeFileName */
 }
 
@@ -884,7 +1011,7 @@ rdp_out_ts_sound_capabilityset(STREAM s)
 	out_uint16_le(s, RDP_CAPLEN_SOUND);
 
 	out_uint16_le(s, soundflags);	/* soundFlags */
-	out_uint16_le(s, 0);		/* pad2OctetsA */
+	out_uint16_le(s, 0);	/* pad2OctetsA */
 }
 
 /* Output Font Capability Set */
@@ -897,7 +1024,7 @@ rdp_out_ts_font_capabilityset(STREAM s)
 	out_uint16_le(s, RDP_CAPLEN_FONT);
 
 	out_uint16_le(s, flags);	/* fontSupportFlags */
-	out_uint16_le(s, 0);		/* pad2octets */
+	out_uint16_le(s, 0);	/* pad2octets */
 }
 
 static void
@@ -930,7 +1057,7 @@ rdp_out_ts_glyphcache_capabilityset(STREAM s)
 
 	out_uint32_le(s, fragcache);	/* FragCache */
 	out_uint16_le(s, supportlvl);	/* GlyphSupportLevel */
-	out_uint16_le(s, 0);		/* pad2octets */
+	out_uint16_le(s, 0);	/* pad2octets */
 }
 
 static void
@@ -973,7 +1100,9 @@ rdp_send_confirm_active(void)
 		RDP_CAPLEN_GLYPHCACHE +
 		RDP_CAPLEN_MULTIFRAGMENTUPDATE +
 		RDP_CAPLEN_LARGE_POINTER +
-		4 /* w2k fix, sessionid */ ;
+		RDP_CAPLEN_VC + 4 /* w2k fix, sessionid */ ;
+
+	logger(Protocol, Debug, "%s()", __func__);
 
 	if (g_rdp_version >= RDP_V5)
 	{
@@ -997,8 +1126,8 @@ rdp_send_confirm_active(void)
 	out_uint16_le(s, sizeof(RDP_SOURCE));
 	out_uint16_le(s, caplen);
 
-	out_uint8p(s, RDP_SOURCE, sizeof(RDP_SOURCE));
-	out_uint16_le(s, 16);	/* num_caps */
+	out_uint8a(s, RDP_SOURCE, sizeof(RDP_SOURCE));
+	out_uint16_le(s, 17);	/* num_caps */
 	out_uint8s(s, 2);	/* pad */
 
 	rdp_out_ts_general_capabilityset(s);
@@ -1019,6 +1148,7 @@ rdp_send_confirm_active(void)
 	rdp_out_control_caps(s);
 	rdp_out_share_caps(s);
 	rdp_out_brushcache_caps(s);
+	rdp_out_virtchan_caps(s);
 
 	rdp_out_ts_input_capabilityset(s);
 	rdp_out_ts_sound_capabilityset(s);
@@ -1029,6 +1159,7 @@ rdp_send_confirm_active(void)
 
 	s_mark_end(s);
 	sec_send(s, sec_flags);
+	s_free(s);
 }
 
 /* Process a general capability set */
@@ -1037,6 +1168,8 @@ rdp_process_general_caps(STREAM s)
 {
 	uint16 pad2octetsB;	/* rdp5 flags? */
 
+	logger(Protocol, Debug, "%s()", __func__);
+
 	in_uint8s(s, 10);
 	in_uint16_le(s, pad2octetsB);
 
@@ -1044,21 +1177,35 @@ rdp_process_general_caps(STREAM s)
 		g_rdp_version = RDP_V4;
 }
 
+static RD_BOOL g_first_bitmap_caps = True;
+
 /* Process a bitmap capability set */
 static void
 rdp_process_bitmap_caps(STREAM s)
 {
-	uint16 width, height, depth;
+
+	uint16 depth;
+
+	logger(Protocol, Debug, "%s()", __func__);
 
 	in_uint16_le(s, depth);
 	in_uint8s(s, 6);
 
-	in_uint16_le(s, width);
-	in_uint16_le(s, height);
+	in_uint16_le(s, g_session_width);
+	in_uint16_le(s, g_session_height);
 
 	logger(Protocol, Debug,
-	       "rdp_process_bitmap_caps(), setting desktop size and depth to: %dx%dx%d", width,
-	       height, depth);
+	       "rdp_process_bitmap_caps(), setting desktop size and depth to: %dx%dx%d",
+	       g_session_width, g_session_height, depth);
+
+	/* Detect if we can have dynamic session resize enabled, only once. */
+	if (g_first_bitmap_caps == True && !(g_session_width == g_requested_session_width
+					     && g_session_height == g_requested_session_height))
+	{
+		logger(Core, Notice, "Disabling dynamic session resize");
+		g_dynamic_session_resize = False;
+	}
+	g_first_bitmap_caps = False;
 
 	/*
 	 * The server may limit depth and change the size of the desktop (for
@@ -1071,15 +1218,23 @@ rdp_process_bitmap_caps(STREAM s)
 		       g_server_depth, depth);
 		g_server_depth = depth;
 	}
-	if (g_width != width || g_height != height)
+
+	/* Resize window size to match session size, except when we're in
+	   fullscreen, where we want the window to always cover the entire
+	   screen. */
+
+	if (g_fullscreen == True)
+		return;
+
+	/* If dynamic session resize is disabled, set window size hints to
+	   fixed session size */
+	if (g_dynamic_session_resize == False)
 	{
-		logger(Protocol, Debug,
-		       "rdp_process_bitmap_caps(), remote desktop changed from %dx%d to %dx%d.\n",
-		       g_width, g_height, width, height);
-		g_width = width;
-		g_height = height;
-		ui_resize_window();
+		ui_update_window_sizehints(g_session_width, g_session_height);
+		return;
 	}
+
+	ui_resize_window(g_session_width, g_session_height);
 }
 
 /* Process server capabilities */
@@ -1087,23 +1242,25 @@ static void
 rdp_process_server_caps(STREAM s, uint16 length)
 {
 	int n;
-	uint8 *next, *start;
+	size_t next, start;
 	uint16 ncapsets, capset_type, capset_length;
 
-	start = s->p;
+	logger(Protocol, Debug, "%s()", __func__);
+
+	start = s_tell(s);
 
 	in_uint16_le(s, ncapsets);
 	in_uint8s(s, 2);	/* pad */
 
 	for (n = 0; n < ncapsets; n++)
 	{
-		if (s->p > start + length)
+		if (s_tell(s) > start + length)
 			return;
 
 		in_uint16_le(s, capset_type);
 		in_uint16_le(s, capset_length);
 
-		next = s->p + capset_length - 4;
+		next = s_tell(s) + capset_length - 4;
 
 		switch (capset_type)
 		{
@@ -1114,9 +1271,15 @@ rdp_process_server_caps(STREAM s, uint16 length)
 			case RDP_CAPSET_BITMAP:
 				rdp_process_bitmap_caps(s);
 				break;
+			case RDP_CAPSET_VC:
+				/* Parse only if we got VCChunkSize */
+				if (capset_length > 8) {
+					rdp_process_virtchan_caps(s);
+				}
+				break;
 		}
 
-		s->p = next;
+		s_seek(s, next);
 	}
 }
 
@@ -1126,6 +1289,7 @@ process_demand_active(STREAM s)
 {
 	uint8 type;
 	uint16 len_src_descriptor, len_combined_caps;
+	struct stream packet = *s;
 
 	/* at this point we need to ensure that we have ui created */
 	rd_create_ui();
@@ -1133,6 +1297,11 @@ process_demand_active(STREAM s)
 	in_uint32_le(s, g_rdp_shareid);
 	in_uint16_le(s, len_src_descriptor);
 	in_uint16_le(s, len_combined_caps);
+
+	if (!s_check_rem(s, len_src_descriptor))
+	{
+		rdp_protocol_error("consume of source descriptor from stream would overrun", &packet);
+	}
 	in_uint8s(s, len_src_descriptor);
 
 	logger(Protocol, Debug, "process_demand_active(), shareid=0x%x", g_rdp_shareid);
@@ -1192,7 +1361,8 @@ process_colour_pointer_common(STREAM s, int bpp)
 	/* keep hotspot within cursor bounding box */
 	x = MIN(x, width - 1);
 	y = MIN(y, height - 1);
-	if (g_local_cursor) return ; /* don't bother creating a cursor we won't use */
+	if (g_local_cursor)
+		return;		/* don't bother creating a cursor we won't use */
 	cursor = ui_create_cursor(x, y, width, height, mask, data, bpp);
 	ui_set_cursor(cursor);
 	cache_put_cursor(cache_idx, cursor);
@@ -1202,6 +1372,8 @@ process_colour_pointer_common(STREAM s, int bpp)
 void
 process_colour_pointer_pdu(STREAM s)
 {
+	logger(Protocol, Debug, "%s()", __func__);
+
 	process_colour_pointer_common(s, 24);
 }
 
@@ -1210,6 +1382,8 @@ void
 process_new_pointer_pdu(STREAM s)
 {
 	int xor_bpp;
+	logger(Protocol, Debug, "%s()", __func__);
+
 
 	in_uint16_le(s, xor_bpp);
 	process_colour_pointer_common(s, xor_bpp);
@@ -1220,6 +1394,8 @@ void
 process_cached_pointer_pdu(STREAM s)
 {
 	uint16 cache_idx;
+	logger(Protocol, Debug, "%s()", __func__);
+
 
 	in_uint16_le(s, cache_idx);
 	ui_set_cursor(cache_get_cursor(cache_idx));
@@ -1230,6 +1406,8 @@ void
 process_system_pointer_pdu(STREAM s)
 {
 	uint32 system_pointer_type;
+	logger(Protocol, Debug, "%s()", __func__);
+
 	in_uint32_le(s, system_pointer_type);
 
 	set_system_pointer(system_pointer_type);
@@ -1249,8 +1427,7 @@ set_system_pointer(uint32 ptr)
 			break;
 		default:
 			logger(Protocol, Warning,
-			       "set_system_pointer(), unhandled pointer type 0x%x",
-			       ptr);
+			       "set_system_pointer(), unhandled pointer type 0x%x", ptr);
 	}
 }
 
@@ -1261,6 +1438,8 @@ process_pointer_pdu(STREAM s)
 	uint16 message_type;
 	uint16 x, y;
 
+	logger(Protocol, Debug, "%s()", __func__);
+
 	in_uint16_le(s, message_type);
 	in_uint8s(s, 2);	/* pad */
 
@@ -1269,8 +1448,7 @@ process_pointer_pdu(STREAM s)
 		case RDP_POINTER_MOVE:
 			in_uint16_le(s, x);
 			in_uint16_le(s, y);
-			if (s_check(s))
-				ui_move_pointer(x, y);
+			ui_move_pointer(x, y);
 			break;
 
 		case RDP_POINTER_COLOR:
@@ -1295,76 +1473,113 @@ process_pointer_pdu(STREAM s)
 	}
 }
 
-/* Process bitmap updates */
+/* Process TS_BITMAP_DATA */
+static void
+process_bitmap_data(STREAM s)
+{
+	uint16 left, top, right, bottom, width, height;
+	uint16 cx, cy, bpp, Bpp, flags, bufsize, size;
+	uint8 *data, *bmpdata;
+	
+	logger(Protocol, Debug, "%s()", __func__);
+
+	struct stream packet = *s;
+
+	in_uint16_le(s, left); /* destLeft */
+	in_uint16_le(s, top); /* destTop */
+	in_uint16_le(s, right); /* destRight */
+	in_uint16_le(s, bottom); /* destBottom */
+	in_uint16_le(s, width); /* width */
+	in_uint16_le(s, height); /* height */
+	in_uint16_le(s, bpp); /*bitsPerPixel */
+	Bpp = (bpp + 7) / 8;
+	in_uint16_le(s, flags); /* flags */
+	in_uint16_le(s, bufsize); /* bitmapLength */
+
+	cx = right - left + 1;
+	cy = bottom - top + 1;
+
+	/* FIXME: There are a assumtion that we do not consider in
+		this code. The value of bpp is not passed to
+		ui_paint_bitmap() which relies on g_server_bpp for drawing
+		the bitmap data.
+
+		Does this means that we can sanity check bpp with g_server_bpp ?
+	*/
+
+	if (Bpp == 0 || width == 0 || height == 0)
+	{
+        logger(Protocol, Warning, "%s(), [%d,%d,%d,%d], [%d,%d], bpp=%d, flags=%x", __func__,
+				left, top, right, bottom, width, height, bpp, flags);
+		rdp_protocol_error("TS_BITMAP_DATA, unsafe size of bitmap data received from server", &packet);
+	}
+
+	if ((RD_UINT32_MAX / Bpp) <= (width * height))
+	{
+		logger(Protocol, Warning, "%s(), [%d,%d,%d,%d], [%d,%d], bpp=%d, flags=%x", __func__,
+				left, top, right, bottom, width, height, bpp, flags);
+		rdp_protocol_error("TS_BITMAP_DATA, unsafe size of bitmap data received from server", &packet);
+	}
+ 
+	if (flags == 0)
+	{
+		/* read uncompressed bitmap data */
+		int y;
+		bmpdata = (uint8 *) xmalloc(width * height * Bpp);
+		for (y = 0; y < height; y++)
+		{
+			in_uint8a(s, &bmpdata[(height - y - 1) * (width * Bpp)], width * Bpp);
+		}
+		
+		ui_paint_bitmap(left, top, cx, cy, width, height, bmpdata);
+		xfree(bmpdata);
+		return;
+	}
+
+	if (flags & NO_BITMAP_COMPRESSION_HDR)
+	{
+		size = bufsize;
+	}
+	else
+	{
+		/* Read TS_CD_HEADER */
+		in_uint8s(s, 2);        /* skip cbCompFirstRowSize (must be 0x0000) */
+		in_uint16_le(s, size);  /* cbCompMainBodySize */
+		in_uint8s(s, 2);        /* skip cbScanWidth */
+		in_uint8s(s, 2);        /* skip cbUncompressedSize */
+	}
+
+	/* read compressed bitmap data */
+	if (!s_check_rem(s, size))
+	{
+		rdp_protocol_error("consume of bitmap data from stream would overrun", &packet);
+	}
+	in_uint8p(s, data, size);
+	bmpdata = (uint8 *) xmalloc(width * height * Bpp);
+	if (bitmap_decompress(bmpdata, width, height, data, size, Bpp))
+	{
+		ui_paint_bitmap(left, top, cx, cy, width, height, bmpdata);
+	}
+	else
+	{
+		logger(Protocol, Warning, "%s(), failed to decompress bitmap", __func__);
+	}
+
+	xfree(bmpdata);
+}
+
+/* Process TS_UPDATE_BITMAP_DATA */
 void
 process_bitmap_updates(STREAM s)
 {
-	uint16 num_updates;
-	uint16 left, top, right, bottom, width, height;
-	uint16 cx, cy, bpp, Bpp, compress, bufsize, size;
-	uint8 *data, *bmpdata;
 	int i;
-
-	in_uint16_le(s, num_updates);
+	uint16 num_updates;
+	
+	in_uint16_le(s, num_updates);   /* rectangles */
 
 	for (i = 0; i < num_updates; i++)
 	{
-		in_uint16_le(s, left);
-		in_uint16_le(s, top);
-		in_uint16_le(s, right);
-		in_uint16_le(s, bottom);
-		in_uint16_le(s, width);
-		in_uint16_le(s, height);
-		in_uint16_le(s, bpp);
-		Bpp = (bpp + 7) / 8;
-		in_uint16_le(s, compress);
-		in_uint16_le(s, bufsize);
-
-		cx = right - left + 1;
-		cy = bottom - top + 1;
-
-		logger(Graphics, Debug,
-		       "process_bitmap_updates(), [%d,%d,%d,%d], [%d,%d], bpp=%d, compression=%d",
-		       left, top, right, bottom, width, height, Bpp, compress);
-
-		if (!compress)
-		{
-			int y;
-			bmpdata = (uint8 *) xmalloc(width * height * Bpp);
-			for (y = 0; y < height; y++)
-			{
-				in_uint8a(s, &bmpdata[(height - y - 1) * (width * Bpp)],
-					  width * Bpp);
-			}
-			ui_paint_bitmap(left, top, cx, cy, width, height, bmpdata);
-			xfree(bmpdata);
-			continue;
-		}
-
-
-		if (compress & 0x400)
-		{
-			size = bufsize;
-		}
-		else
-		{
-			in_uint8s(s, 2);	/* pad */
-			in_uint16_le(s, size);
-			in_uint8s(s, 4);	/* line_size, final_size */
-		}
-		in_uint8p(s, data, size);
-		bmpdata = (uint8 *) xmalloc(width * height * Bpp);
-		if (bitmap_decompress(bmpdata, width, height, data, size, Bpp))
-		{
-			ui_paint_bitmap(left, top, cx, cy, width, height, bmpdata);
-		}
-		else
-		{
-			logger(Graphics, Warning,
-			       "process_bitmap_updates(), failed to decompress bitmap");
-		}
-
-		xfree(bmpdata);
+		process_bitmap_data(s);
 	}
 }
 
@@ -1411,6 +1626,8 @@ process_update_pdu(STREAM s)
 	switch (update_type)
 	{
 		case RDP_UPDATE_ORDERS:
+			logger(Protocol, Debug, "%s(), RDP_UPDATE_ORDERS", __func__);
+
 			in_uint8s(s, 2);	/* pad */
 			in_uint16_le(s, count);
 			in_uint8s(s, 2);	/* pad */
@@ -1418,14 +1635,17 @@ process_update_pdu(STREAM s)
 			break;
 
 		case RDP_UPDATE_BITMAP:
+			logger(Protocol, Debug, "%s(), RDP_UPDATE_BITMAP", __func__);
 			process_bitmap_updates(s);
 			break;
 
 		case RDP_UPDATE_PALETTE:
+			logger(Protocol, Debug, "%s(), RDP_UPDATE_PALETTE", __func__);
 			process_palette(s);
 			break;
 
 		case RDP_UPDATE_SYNCHRONIZE:
+			logger(Protocol, Debug, "%s(), RDP_UPDATE_SYNCHRONIZE", __func__);
 			break;
 
 		default:
@@ -1436,62 +1656,88 @@ process_update_pdu(STREAM s)
 }
 
 
-/* Process a Save Session Info PDU */
+/* Process TS_LOGIN_INFO_EXTENDED data structure */
+static void
+process_ts_logon_info_extended(STREAM s)
+{
+	uint32 fieldspresent;
+	uint32 len;
+	uint32 version;
+
+	logger(Protocol, Debug, "%s()", __func__);
+
+	in_uint8s(s, 2);	/* Length */
+	in_uint32_le(s, fieldspresent);
+	if (fieldspresent & LOGON_EX_AUTORECONNECTCOOKIE)
+	{
+		/* TS_LOGON_INFO_FIELD */
+		in_uint8s(s, 4);	/* cbFieldData */
+
+		/* ARC_SC_PRIVATE_PACKET */
+		in_uint32_le(s, len);
+		if (len != 28)
+		{
+			logger(Protocol, Error,
+			       "process_ts_logon_info_extended(), invalid length in Auto-Reconnect packet");
+			return;
+		}
+
+		in_uint32_le(s, version);
+		if (version != 1)
+		{
+			logger(Protocol, Error,
+			       "process_ts_logon_info_extended(), unsupported version of Auto-Reconnect packet");
+			return;
+		}
+
+		in_uint32_le(s, g_reconnect_logonid);
+		in_uint8a(s, g_reconnect_random, 16);
+		g_has_reconnect_random = True;
+		g_reconnect_random_ts = time(NULL);
+		logger(Protocol, Debug,
+		       "process_ts_logon_info_extended(), saving Auto-Reconnect cookie, id=%u",
+		       g_reconnect_logonid);
+
+		gettimeofday(&g_pending_resize_defer_timer, NULL);
+	}
+}
+
+/* Process TS_SAVE_SESSION_INFO_PDU_DATA data structure */
 void
 process_pdu_logon(STREAM s)
 {
 	uint32 infotype;
 	in_uint32_le(s, infotype);
-	if (infotype == INFOTYPE_LOGON_EXTENDED_INF)
+
+	switch (infotype)
 	{
-		uint32 fieldspresent;
-
-		in_uint8s(s, 2);	/* Length */
-		in_uint32_le(s, fieldspresent);
-		if (fieldspresent & LOGON_EX_AUTORECONNECTCOOKIE)
-		{
-			uint32 len;
-			uint32 version;
-
-			/* TS_LOGON_INFO_FIELD */
-			in_uint8s(s, 4);	/* cbFieldData */
-
-			/* ARC_SC_PRIVATE_PACKET */
-			in_uint32_le(s, len);
-			if (len != 28)
-			{
-				logger(Protocol, Error,
-				       "process_pdu_logon(), invalid length in Auto-Reconnect packet");
-				return;
-			}
-
-			in_uint32_le(s, version);
-			if (version != 1)
-			{
-				logger(Protocol, Error,
-				       "process_pdu_logon(), unsupported version of Auto-Reconnect packet");
-				return;
-			}
-
-			in_uint32_le(s, g_reconnect_logonid);
-			in_uint8a(s, g_reconnect_random, 16);
-			g_has_reconnect_random = True;
-			g_reconnect_random_ts = time(NULL);
+		case INFOTYPE_LOGON_PLAINNOTIFY:	/* TS_PLAIN_NOTIFY */
 			logger(Protocol, Debug,
-			       "process_pdu_logon(), saving Auto-Reconnect cookie, id=%u",
-			       g_reconnect_logonid);
-		}
+			       "process_pdu_logon(), Received TS_LOGIN_PLAIN_NOTIFY");
+			in_uint8s(s, 576);	/* pad */
+			break;
+
+		case INFOTYPE_LOGON_EXTENDED_INF:	/* TS_LOGON_INFO_EXTENDED */
+			logger(Protocol, Debug,
+			       "process_pdu_logon(), Received TS_LOGIN_INFO_EXTENDED");
+			process_ts_logon_info_extended(s);
+			break;
+
+		default:
+			logger(Protocol, Warning,
+			       "process_pdu_logon(), Unhandled login infotype %d", infotype);
 	}
 }
 
 
-/* Process a disconnect PDU */
-void
-process_disconnect_pdu(STREAM s, uint32 * ext_disc_reason)
+/* Process a Set Error Info PDU */
+static void
+process_ts_set_error_info_pdu(STREAM s, uint32 * ext_disc_reason)
 {
 	in_uint32_le(s, *ext_disc_reason);
 
-	logger(Protocol, Debug, "process_disconnect_pdu(), reason = %d", ext_disc_reason);
+	logger(Protocol, Debug, "process_ts_set_error_info_pdu(), error info = %d",
+	       *ext_disc_reason);
 }
 
 /* Process data PDU */
@@ -1503,6 +1749,7 @@ process_data_pdu(STREAM s, uint32 * ext_disc_reason)
 	uint16 clen;
 	uint32 len;
 
+	uint8 *buf;
 	uint32 roff, rlen;
 
 	struct stream *ns = &(g_mppc_dict.ns);
@@ -1519,21 +1766,22 @@ process_data_pdu(STREAM s, uint32 * ext_disc_reason)
 		if (len > RDP_MPPC_DICT_SIZE)
 			logger(Protocol, Error,
 			       "process_data_pdu(), error decompressed packet size exceeds max");
-		if (mppc_expand(s->p, clen, ctype, &roff, &rlen) == -1)
+		in_uint8p(s, buf, clen);
+		if (mppc_expand(buf, clen, ctype, &roff, &rlen) == -1)
 			logger(Protocol, Error,
 			       "process_data_pdu(), error while decompressing packet");
 
 		/* len -= 18; */
 
 		/* allocate memory and copy the uncompressed data into the temporary stream */
-		ns->data = (uint8 *) xrealloc(ns->data, rlen);
+		s_realloc(ns, rlen);
+		s_reset(ns);
 
-		memcpy((ns->data), (unsigned char *) (g_mppc_dict.hist + roff), rlen);
+		out_uint8a(ns, (unsigned char *) (g_mppc_dict.hist + roff), rlen);
 
-		ns->size = rlen;
-		ns->end = (ns->data + ns->size);
-		ns->p = ns->data;
-		ns->rdp_hdr = ns->p;
+		s_mark_end(ns);
+		s_seek(ns, 0);
+		s_push_layer(ns, rdp_hdr, 0);
 
 		s = ns;
 	}
@@ -1566,8 +1814,8 @@ process_data_pdu(STREAM s, uint32 * ext_disc_reason)
 			process_pdu_logon(s);
 			break;
 
-		case RDP_DATA_PDU_DISCONNECT:
-			process_disconnect_pdu(s, ext_disc_reason);
+		case RDP_DATA_PDU_SET_ERROR_INFO:
+			process_ts_set_error_info_pdu(s, ext_disc_reason);
 
 			/* We used to return true and disconnect immediately here, but
 			 * Windows Vista sends a disconnect PDU with reason 0 when
@@ -1594,6 +1842,8 @@ process_redirect_pdu(STREAM s, RD_BOOL enhanced_redirect /*, uint32 * ext_disc_r
 {
 	uint32 len;
 	uint16 redirect_identifier;
+
+	logger(Protocol, Debug, "%s()", __func__);
 
 	/* reset any previous redirection information */
 	g_redirect = True;
@@ -1691,7 +1941,7 @@ process_redirect_pdu(STREAM s, RD_BOOL enhanced_redirect /*, uint32 * ext_disc_r
 		g_redirect_cookie = xmalloc(g_redirect_cookie_len);
 
 		/* read cookie as is */
-		in_uint8p(s, g_redirect_cookie, g_redirect_cookie_len);
+		in_uint8a(s, g_redirect_cookie, g_redirect_cookie_len);
 
 		logger(Protocol, Debug, "process_redirect_pdu(), Read %d bytes redirection cookie",
 		       g_redirect_cookie_len);
@@ -1720,14 +1970,14 @@ process_redirect_pdu(STREAM s, RD_BOOL enhanced_redirect /*, uint32 * ext_disc_r
 	{
 		in_uint32_le(s, len);
 
-		/* Let target fqdn replace target ip address */
+		/* Let target FQDN replace target IP address */
 		if (g_redirect_server)
 		{
 			free(g_redirect_server);
 			g_redirect_server = NULL;
 		}
 
-		/* read fqdn string */
+		/* read FQDN string */
 		rdp_in_unistr(s, len, &g_redirect_server, &g_redirect_server_len);
 	}
 
@@ -1769,23 +2019,24 @@ process_redirect_pdu(STREAM s, RD_BOOL enhanced_redirect /*, uint32 * ext_disc_r
 		       "process_redirect_pdu(), unhandled LB_TARGET_CERTIFICATE");
 	}
 
-	return True;
+	return g_redirect;
 }
 
 /* Process incoming packets */
 void
 rdp_main_loop(RD_BOOL * deactivated, uint32 * ext_disc_reason)
 {
-	while (rdp_loop(deactivated, ext_disc_reason))
+	do
 	{
-		if (g_pending_resize || g_redirect)
+		if (rdp_loop(deactivated, ext_disc_reason) == False)
 		{
-			return;
+			g_exit_mainloop = True;
 		}
 	}
+	while (g_exit_mainloop == False);
 }
 
-/* used in uiports and rdp_main_loop, processes the rdp packets waiting */
+/* used in uiports and rdp_main_loop, processes the RDP packets waiting */
 RD_BOOL
 rdp_loop(RD_BOOL * deactivated, uint32 * ext_disc_reason)
 {
@@ -1793,7 +2044,7 @@ rdp_loop(RD_BOOL * deactivated, uint32 * ext_disc_reason)
 	RD_BOOL cont = True;
 	STREAM s;
 
-	while (cont)
+	while (g_exit_mainloop == False && cont)
 	{
 		s = rdp_recv(&type);
 		if (s == NULL)
@@ -1808,12 +2059,15 @@ rdp_loop(RD_BOOL * deactivated, uint32 * ext_disc_reason)
 				logger(Protocol, Debug,
 				       "rdp_loop(), RDP_PDU_DEACTIVATE packet received");
 				*deactivated = True;
+				g_wait_for_deactivate_ts = 0;
 				break;
 			case RDP_PDU_REDIRECT:
-				return process_redirect_pdu(s, False);
-				break;
 			case RDP_PDU_ENHANCED_REDIRECT:
-				return process_redirect_pdu(s, True);
+				if (process_redirect_pdu(s, !(type == RDP_PDU_REDIRECT)) == True)
+				{
+					g_exit_mainloop = True;
+					continue;
+				}
 				break;
 			case RDP_PDU_DATA:
 				/* If we got a data PDU, we don't need to keep the password in memory
@@ -1823,13 +2077,11 @@ rdp_loop(RD_BOOL * deactivated, uint32 * ext_disc_reason)
 
 				process_data_pdu(s, ext_disc_reason);
 				break;
-			case 0:
-				break;
 			default:
 				logger(Protocol, Warning,
 				       "rdp_loop(), unhandled PDU type %d received", type);
 		}
-		cont = g_next_packet < s->end;
+		cont = g_next_packet < s_length(s);
 	}
 	return True;
 }
@@ -1845,7 +2097,7 @@ rdp_connect(char *server, uint32 flags, char *domain, char *password,
 	if (!sec_connect(server, g_username, domain, password, reconnect))
 		return False;
 
-	rdp_send_logon_info(flags, domain, g_username, password, command, directory);
+	rdp_send_client_info_pdu(flags, domain, g_username, password, command, directory);
 
 	/* run RDP loop until first licence demand active PDU */
 	while (!g_rdp_shareid)
@@ -1866,8 +2118,11 @@ rdp_connect(char *server, uint32 flags, char *domain, char *password,
 void
 rdp_reset_state(void)
 {
-	g_next_packet = NULL;	/* reset the packet information */
+	logger(Protocol, Debug, "%s()", __func__);
+	g_next_packet = 0;	/* reset the packet information */
 	g_rdp_shareid = 0;
+	g_exit_mainloop = False;
+	g_first_bitmap_caps = True;
 	sec_reset_state();
 }
 
@@ -1875,5 +2130,25 @@ rdp_reset_state(void)
 void
 rdp_disconnect(void)
 {
+	logger(Protocol, Debug, "%s()", __func__);
 	sec_disconnect();
+}
+
+/* Abort rdesktop upon protocol error
+
+   A protocol error is defined as:
+
+    - A value is outside specified range for example;
+      bpp for a bitmap is not allowed to be greater than the
+      value 32 but is represented by a byte in protocol.
+
+*/
+void
+_rdp_protocol_error(const char *file, int line, const char *func,
+		    const char *message, STREAM s)
+{
+	logger(Protocol, Error, "%s:%d: %s(), %s", file, line, func, message);
+	if (s)
+		hexdump(s->data, s_length(s));
+	exit(0);
 }

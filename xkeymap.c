@@ -44,6 +44,8 @@ extern int g_keyboard_subtype;
 extern int g_keyboard_functionkeys;
 extern int g_win_button_size;
 extern RD_BOOL g_enable_compose;
+extern RD_BOOL g_seamless_rdp;
+extern RD_BOOL g_seamless_active;
 extern RDP_VERSION g_rdp_version;
 extern RD_BOOL g_numlock_sync;
 
@@ -208,7 +210,7 @@ add_sequence(char *rest, char *mapname)
 		return;
 	}
 
-	logger(Keyboard, Debug, "add_sequence(), adding squence for keysym '%s' (0x%lx)", keyname,
+	logger(Keyboard, Debug, "add_sequence(), adding sequence for keysym '%s' (0x%lx)", keyname,
 	       keysym);
 
 	entry = new_key_translation_entry(keysym);
@@ -644,7 +646,21 @@ handle_special_keys(uint32 keysym, unsigned int state, uint32 ev_time, RD_BOOL p
 			{
 				/* Ctrl-Alt-Enter: toggle full screen */
 				if (pressed)
-					xwin_toggle_fullscreen();
+				{
+					if (!g_seamless_rdp)
+					{
+						/* only allow toggle fullscreen when not running
+						   rdesktop in seamless mode */
+						xwin_toggle_fullscreen();
+					}
+					else
+					{
+						/* deactivate seamless mode for debug purpose, one can
+						   not activate seamless mode again  */
+						if (g_seamless_active)
+							ui_seamless_toggle();
+					}
+				}
 				return True;
 			}
 			break;

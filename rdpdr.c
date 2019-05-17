@@ -3,7 +3,8 @@
    Copyright (C) Matthew Chapman <matthewc.unsw.edu.au> 1999-2008
    Copyright 2004-2011 Peter Astrand <astrand@cendio.se> for Cendio AB
    Copyright 2010-2017 Henrik Andersson <hean01@cendio.se> for Cendio AB
-   Copyright 2017 Karl Mikaelsson <derfian@cendio.se> for Cendio AB
+   Copyright 2017-2019 Karl Mikaelsson <derfian@cendio.se> for Cendio AB
+   Copyright 2016, 2018 Alexander Zakharov <uglym8@gmail.com>
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -83,10 +84,11 @@ char *g_rdpdr_clientname = NULL;
 
 /* Used to store incoming io request, until they are ready to be completed */
 /* using a linked list ensures that they are processed in the right order, */
-/* if multiple ios are being done on the same fd */
+/* if multiple IOs are being done on the same FD */
 struct async_iorequest
 {
-	uint32 fd, major, minor, offset, device, id, length, partial_len;
+	uint32 fd, major, minor, device, id, length, partial_len;
+	uint64 offset;
 	long timeout,		/* Total timeout */
 	  itv_timeout;		/* Interval timeout (between serial characters) */
 	uint8 *buffer;
@@ -123,7 +125,7 @@ convert_to_unix_filename(char *filename)
 }
 
 static RD_BOOL
-rdpdr_handle_ok(int device, int handle)
+rdpdr_handle_ok(uint32 device, RD_NTHANDLE handle)
 {
 	switch (g_rdpdr_device[device].device_type)
 	{
@@ -146,7 +148,7 @@ rdpdr_handle_ok(int device, int handle)
 static RD_BOOL
 add_async_iorequest(uint32 device, uint32 file, uint32 id, uint32 major, uint32 length,
 		    DEVICE_FNS * fns, uint32 total_timeout, uint32 interval_timeout, uint8 * buffer,
-		    uint32 offset)
+		    uint64 offset)
 {
 	struct async_iorequest *iorq;
 
@@ -202,6 +204,7 @@ rdpdr_send_client_announce_reply(void)
 	out_uint32_be(s, g_client_id);	/* ClientID */
 	s_mark_end(s);
 	channel_send(s, rdpdr_channel);
+	s_free(s);
 }
 
 
@@ -210,14 +213,14 @@ rdpdr_send_client_name_request(void)
 {
 	/* DR_CORE_CLIENT_NAME_REQ */
 	STREAM s;
-	struct stream name = {0};
+	struct stream name = { 0 };
 
 	if (NULL == g_rdpdr_clientname)
 	{
 		g_rdpdr_clientname = g_hostname;
 	}
 
-	s_realloc(&name, 512*4);
+	s_realloc(&name, 512 * 4);
 	s_reset(&name);
 	out_utf16s(&name, g_rdpdr_clientname);
 	s_mark_end(&name);
@@ -231,13 +234,14 @@ rdpdr_send_client_name_request(void)
 	out_stream(s, &name);
 	s_mark_end(s);
 	channel_send(s, rdpdr_channel);
+	s_free(s);
 }
 
 /* Returns the size of the payload of the announce packet */
-static int
+static size_t
 announcedata_size()
 {
-	int size, i;
+	size_t size, i;
 	PRINTER *printerinfo;
 	DISK_DEVICE *diskinfo;
 
@@ -280,11 +284,13 @@ rdpdr_send_client_device_list_announce(void)
 {
 	/* DR_CORE_CLIENT_ANNOUNCE_RSP */
 	uint32 bloblen, disklen, flags;
-	int i;
+	size_t i;
 	STREAM s;
 	PRINTER *printerinfo;
 	DISK_DEVICE *diskinfo;
-	struct stream drv = {0}, prt = {0};
+	struct stream drv = { 0 }, prt =
+	{
+	0};
 
 	s = channel_init(rdpdr_channel, announcedata_size());
 	out_uint16_le(s, RDPDR_CTYP_CORE);
@@ -296,7 +302,7 @@ rdpdr_send_client_device_list_announce(void)
 	{
 		out_uint32_le(s, g_rdpdr_device[i].device_type);
 		out_uint32_le(s, i);	/* RDP Device ID */
-		out_uint8p(s, g_rdpdr_device[i].name, 8);	/* preferredDosName, limited to 8 characters */
+		out_uint8a(s, g_rdpdr_device[i].name, 8);	/* preferredDosName, limited to 8 characters */
 		switch (g_rdpdr_device[i].device_type)
 		{
 			case DEVICE_TYPE_DISK:
@@ -310,18 +316,18 @@ rdpdr_send_client_device_list_announce(void)
 				disklen = strlen(diskinfo->name) + 1;
 
 				out_uint32_le(s, disklen);	/* DeviceDataLength */
-				out_uint8p(s, diskinfo->name, disklen);	/* DeviceData */
+				out_uint8a(s, diskinfo->name, disklen);	/* DeviceData */
 				break;
 
 			case DEVICE_TYPE_PRINTER:
 				printerinfo = (PRINTER *) g_rdpdr_device[i].pdevice_data;
 
-				s_realloc(&prt, 512*4);
+				s_realloc(&prt, 512 * 4);
 				s_reset(&prt);
 				out_utf16s(&prt, printerinfo->printer);
 				s_mark_end(&prt);
 
-				s_realloc(&drv, 512*4);
+				s_realloc(&drv, 512 * 4);
 				s_reset(&drv);
 				out_utf16s(&drv, printerinfo->driver);
 				s_mark_end(&drv);
@@ -353,6 +359,7 @@ rdpdr_send_client_device_list_announce(void)
 
 	s_mark_end(s);
 	channel_send(s, rdpdr_channel);
+	s_free(s);
 }
 
 void
@@ -364,6 +371,15 @@ rdpdr_send_completion(uint32 device, uint32 id, uint32 status, uint32 result, ui
 #ifdef WITH_SCARD
 	scard_lock(SCARD_LOCK_RDPDR);
 #endif
+	if (status == RD_STATUS_BUFFER_TOO_SMALL) {
+		/*
+		 * Not enough space has been allocated by server to store the result.
+		 * Send STATUS_BUFFER_TOO_SMALL error as a IoStatus.
+		 */
+		result = 0;
+		length = 0;
+	}
+
 	s = channel_init(rdpdr_channel, 20 + length);
 	out_uint16_le(s, RDPDR_CTYP_CORE);
 	out_uint16_le(s, PAKID_CORE_DEVICE_IOCOMPLETION);
@@ -371,18 +387,21 @@ rdpdr_send_completion(uint32 device, uint32 id, uint32 status, uint32 result, ui
 	out_uint32_le(s, id);
 	out_uint32_le(s, status);
 	out_uint32_le(s, result);
-	out_uint8p(s, buffer, length);
+	if (length)
+		out_uint8a(s, buffer, length);
 	s_mark_end(s);
 
 	logger(Protocol, Debug, "rdpdr_send_completion()");
 	/* hexdump(s->channel_hdr + 8, s->end - s->channel_hdr - 8); */
 
 	channel_send(s, rdpdr_channel);
+	s_free(s);
 #ifdef WITH_SCARD
 	scard_unlock(SCARD_LOCK_RDPDR);
 #endif
 }
 
+/* Processes a DR_DEVICE_IOREQUEST (minus the leading header field) */
 static void
 rdpdr_process_irp(STREAM s)
 {
@@ -392,20 +411,20 @@ rdpdr_process_irp(STREAM s)
 		request,
 		file,
 		info_level,
-		buffer_len,
 		id,
 		major,
 		minor,
 		device,
-		offset,
 		bytes_out,
 		share_mode, disposition, total_timeout, interval_timeout, flags_and_attributes = 0;
+
+	uint64 offset;
 
 	char *filename;
 	uint32 filename_len;
 
-	uint8 *buffer, *pst_buf;
-	struct stream out;
+	uint8 *pst_buf;
+	STREAM out;
 	DEVICE_FNS *fns;
 	RD_BOOL rw_blocking = True;
 	RD_NTSTATUS status = RD_STATUS_INVALID_DEVICE_REQUEST;
@@ -418,16 +437,13 @@ rdpdr_process_irp(STREAM s)
 
 	filename = NULL;
 
-	buffer_len = 0;
-	buffer = (uint8 *) xmalloc(1024);
-	buffer[0] = 0;
+	out = NULL;
 
 	if (device >= RDPDR_MAX_DEVICES)
 	{
 		logger(Protocol, Error,
 		       "rdpdr_process_irp(), invalid irp device=0x%lx, file=0x%lx, id=0x%lx, major=0x%lx, minor=0x%lx",
 		       device, file, id, major, minor);
-		xfree(buffer);
 		return;
 	}
 
@@ -466,7 +482,6 @@ rdpdr_process_irp(STREAM s)
 			logger(Protocol, Error,
 			       "rdpdr_process_irp(), received IRP for unknown device type %ld",
 			       device);
-			xfree(buffer);
 			return;
 	}
 
@@ -476,7 +491,7 @@ rdpdr_process_irp(STREAM s)
 
 			in_uint32_be(s, desired_access);
 			in_uint8s(s, 0x08);	/* unknown */
-			in_uint8s(s, 4);       /* skip error_mode*/
+			in_uint8s(s, 4);	/* skip error_mode */
 			in_uint32_le(s, share_mode);
 			in_uint32_le(s, disposition);
 			in_uint32_le(s, flags_and_attributes);
@@ -500,7 +515,9 @@ rdpdr_process_irp(STREAM s)
 					     flags_and_attributes, filename, &result);
 
 			free(filename);
-			buffer_len = 1;
+			out = s_alloc(1);
+			out_uint8(out, 0);
+			s_mark_end(out);
 			break;
 
 		case IRP_MJ_CLOSE:
@@ -522,11 +539,12 @@ rdpdr_process_irp(STREAM s)
 			}
 
 			in_uint32_le(s, length);
-			in_uint32_le(s, offset);
+			in_uint64_le(s, offset);
+			in_uint8s(s, 20); 	   /* 20 bytes of padding */
 
 			logger(Protocol, Debug,
-			       "rdpdr_process_irp(), IRP Read length=%d, offset=%d", length,
-			       offset);
+			       "rdpdr_process_irp(), IRP Read length=%d, offset=%ld",
+			       length, offset);
 
 			if (!rdpdr_handle_ok(device, file))
 			{
@@ -536,14 +554,14 @@ rdpdr_process_irp(STREAM s)
 
 			if (rw_blocking)	/* Complete read immediately */
 			{
-				buffer = (uint8 *) xrealloc((void *) buffer, length);
-				if (!buffer)
-				{
-					status = RD_STATUS_CANCELLED;
-					break;
-				}
+				uint8* buffer;
+				out = s_alloc(length);
+				out_uint8p(out, buffer, length);
 				status = fns->read(file, buffer, length, offset, &result);
-				buffer_len = result;
+				/* Might have read less */
+				s_mark_end(out);
+				s_seek(out, result);
+				s_mark_end(out);
 				break;
 			}
 
@@ -567,7 +585,9 @@ rdpdr_process_irp(STREAM s)
 			break;
 		case IRP_MJ_WRITE:
 
-			buffer_len = 1;
+			out = s_alloc(1);
+			out_uint8(out, 0);
+			s_mark_end(out);
 
 			if (!fns->write)
 			{
@@ -576,10 +596,12 @@ rdpdr_process_irp(STREAM s)
 			}
 
 			in_uint32_le(s, length);
-			in_uint32_le(s, offset);
-			in_uint8s(s, 0x18);
+			in_uint64_le(s, offset);
+			in_uint8s(s, 20);        /* 20 bytes of padding before WriteData */
 
-			logger(Protocol, Debug, "rdpdr_process_irp(), IRP Write length=%d", result);
+			logger(Protocol, Debug,
+			       "rdpdr_process_irp(), IRP Write length=%d, offset=%ld",
+			       result, offset);
 
 			if (!rdpdr_handle_ok(device, file))
 			{
@@ -589,7 +611,9 @@ rdpdr_process_irp(STREAM s)
 
 			if (rw_blocking)	/* Complete immediately */
 			{
-				status = fns->write(file, s->p, length, offset, &result);
+				unsigned char *data;
+				in_uint8p(s, data, length);
+				status = fns->write(file, data, length, offset, &result);
 				break;
 			}
 
@@ -622,10 +646,10 @@ rdpdr_process_irp(STREAM s)
 			}
 			in_uint32_le(s, info_level);
 
-			out.data = out.p = buffer;
-			out.size = sizeof(buffer);
-			status = disk_query_information(file, info_level, &out);
-			result = buffer_len = out.p - out.data;
+			out = s_alloc(1024);
+			status = disk_query_information(file, info_level, out);
+			s_mark_end(out);
+			result = s_length(out);
 
 			break;
 
@@ -639,10 +663,10 @@ rdpdr_process_irp(STREAM s)
 
 			in_uint32_le(s, info_level);
 
-			out.data = out.p = buffer;
-			out.size = sizeof(buffer);
-			status = disk_set_information(file, info_level, s, &out);
-			result = buffer_len = out.p - out.data;
+			out = s_alloc(1024);
+			status = disk_set_information(file, info_level, s, out);
+			s_mark_end(out);
+			result = s_length(out);
 			break;
 
 		case IRP_MJ_QUERY_VOLUME_INFORMATION:
@@ -655,10 +679,10 @@ rdpdr_process_irp(STREAM s)
 
 			in_uint32_le(s, info_level);
 
-			out.data = out.p = buffer;
-			out.size = sizeof(buffer);
-			status = disk_query_volume_information(file, info_level, &out);
-			result = buffer_len = out.p - out.data;
+			out = s_alloc(1024);
+			status = disk_query_volume_information(file, info_level, out);
+			s_mark_end(out);
+			result = s_length(out);
 			break;
 
 		case IRP_MJ_DIRECTORY_CONTROL:
@@ -684,13 +708,16 @@ rdpdr_process_irp(STREAM s)
 							convert_to_unix_filename(filename);
 					}
 
-					out.data = out.p = buffer;
-					out.size = sizeof(buffer);
+					out = s_alloc(1024);
 					status = disk_query_directory(file, info_level, filename,
-								      &out);
-					result = buffer_len = out.p - out.data;
-					if (!buffer_len)
-						buffer_len++;
+								      out);
+					s_mark_end(out);
+					if (!s_length(out))
+					{
+						out_uint8(out, 0);
+						s_mark_end(out);
+					}
+					result = s_length(out);
 
 					free(filename);
 					break;
@@ -728,26 +755,23 @@ rdpdr_process_irp(STREAM s)
 				break;
 			}
 
+			/* DR_CONTROL_REQ (2.2.1.4.5 of MS-RDPEFS) */
+			/* OutputBufferLength */
 			in_uint32_le(s, bytes_out);
-			in_uint8s(s,4);                  /* skip  bytes_in */
+			in_uint8s(s, 4);	/* skip  bytes_in */
 			in_uint32_le(s, request);
+			/* Padding */
 			in_uint8s(s, 0x14);
 
-			buffer = (uint8 *) xrealloc((void *) buffer, bytes_out + 0x14);
-			if (!buffer)
-			{
-				status = RD_STATUS_CANCELLED;
-				break;
-			}
-
-			out.data = out.p = buffer;
-			out.size = sizeof(buffer);
+			/* TODO: Why do we need to increase length by padlen? Or is it hdr len? */
+			out = s_alloc(bytes_out + 0x14);
 
 #ifdef WITH_SCARD
 			scardSetInfo(g_epoch, device, id, bytes_out + 0x14);
 #endif
-			status = fns->device_control(file, request, s, &out);
-			result = buffer_len = out.p - out.data;
+			status = fns->device_control(file, request, s, out);
+			s_mark_end(out);
+			result = s_length(out);
 
 			/* Serial SERIAL_WAIT_ON_MASK */
 			if (status == RD_STATUS_PENDING)
@@ -776,12 +800,12 @@ rdpdr_process_irp(STREAM s)
 
 			in_uint32_le(s, info_level);
 
-			out.data = out.p = buffer;
-			out.size = sizeof(buffer);
+			out = s_alloc(1024);
 			/* FIXME: Perhaps consider actually *do*
 			   something here :-) */
 			status = RD_STATUS_SUCCESS;
-			result = buffer_len = out.p - out.data;
+			s_mark_end(out);
+			result = s_length(out);
 			break;
 
 		default:
@@ -793,11 +817,25 @@ rdpdr_process_irp(STREAM s)
 
 	if (status != RD_STATUS_PENDING)
 	{
+		size_t buffer_len;
+		uint8 *buffer;
+
+		if (out != NULL)
+		{
+			buffer_len = s_length(out);
+			s_seek(out, 0);
+			in_uint8p(out, buffer, buffer_len);
+		}
+		else
+		{
+			buffer_len = 0;
+			buffer = NULL;
+		}
+
 		rdpdr_send_completion(device, id, status, result, buffer, buffer_len);
 	}
-	if (buffer)
-		xfree(buffer);
-	buffer = NULL;
+	if (out)
+		s_free(out);
 }
 
 static void
@@ -843,6 +881,7 @@ rdpdr_send_client_capability_response(void)
 
 	s_mark_end(s);
 	channel_send(s, rdpdr_channel);
+	s_free(s);
 }
 
 static void
@@ -854,10 +893,10 @@ rdpdr_process(STREAM s)
 	uint16 pakid;
 
 	logger(Protocol, Debug, "rdpdr_process()");
-	/* hexdump(s->p, s->end - s->p); */
+	/* hexdump(s->p, s_remaining(s)); */
 
-	in_uint16(s, component);
-	in_uint16(s, pakid);
+	in_uint16(s, component);        /* RDPDR_HEADER.Component */
+	in_uint16(s, pakid);            /* RDPDR_HEADER.PacketId */
 
 	if (component == RDPDR_CTYP_CORE)
 	{
@@ -871,6 +910,7 @@ rdpdr_process(STREAM s)
 				/* DR_CORE_SERVER_ANNOUNCE_REQ */
 				in_uint8s(s, 2);	/* skip versionMajor */
 				in_uint16_le(s, vmin);	/* VersionMinor */
+
 				in_uint32_le(s, g_client_id);	/* ClientID */
 
 				/* The RDP client is responsibility to provide a random client id
@@ -878,6 +918,30 @@ rdpdr_process(STREAM s)
 				if (vmin < 0x000c)
 					g_client_id = 0x815ed39d;	/* IP address (use 127.0.0.1) 0x815ed39d */
 				g_epoch++;
+
+#if WITH_SCARD
+				/*
+				 * We need to release all SCARD contexts to end all
+				 * current transactions and pending calls
+				 */
+				scard_release_all_contexts();
+
+				/*
+				 * According to [MS-RDPEFS] 3.2.5.1.2:
+				 *
+				 * If this packet appears after a sequence of other packets,
+				 * it is a signal that the server has reconnected to a new session
+				 * and the whole sequence has been reset. The client MUST treat
+				 * this packet as the beginning of a new sequence.
+				 * The client MUST also cancel all outstanding requests and release
+				 * previous references to all devices.
+				 *
+				 * If any problem arises in the future, please, pay attention to the
+				 * "If this packet appears after a sequence of other packets" part
+				 *
+				 */
+
+#endif
 
 				rdpdr_send_client_announce_reply();
 				rdpdr_send_client_name_request();
@@ -929,7 +993,7 @@ rdpdr_init()
 void
 rdpdr_add_fds(int *n, fd_set * rfds, fd_set * wfds, struct timeval *tv, RD_BOOL * timeout)
 {
-	uint32 select_timeout = 0;	/* Timeout value to be used for select() (in millisecons). */
+	uint32 select_timeout = 0;	/* Timeout value to be used for select() (in milliseconds). */
 	struct async_iorequest *iorq;
 	char c;
 
@@ -947,7 +1011,7 @@ rdpdr_add_fds(int *n, fd_set * rfds, fd_set * wfds, struct timeval *tv, RD_BOOL 
 					   support for reconnects. */
 
 					FD_SET(iorq->fd, rfds);
-					*n = MAX(*n, iorq->fd);
+					*n = MAX(*n, (int) iorq->fd);
 
 					/* Check if io request timeout is smaller than current (but not 0). */
 					if (iorq->timeout
@@ -982,7 +1046,7 @@ rdpdr_add_fds(int *n, fd_set * rfds, fd_set * wfds, struct timeval *tv, RD_BOOL 
 						break;
 
 					FD_SET(iorq->fd, wfds);
-					*n = MAX(*n, iorq->fd);
+					*n = MAX(*n, (int) iorq->fd);
 					break;
 
 				case IRP_MJ_DEVICE_CONTROL:

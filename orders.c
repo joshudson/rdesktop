@@ -20,7 +20,7 @@
 #include "rdesktop.h"
 #include "orders.h"
 
-extern uint8 *g_next_packet;
+extern size_t g_next_packet;
 static RDP_ORDER_STATE g_order_state;
 extern RDP_VERSION g_rdp_version;
 
@@ -101,7 +101,7 @@ rdp_in_colour(STREAM s, uint32 * colour)
 }
 
 /* Parse bounds information */
-static RD_BOOL
+static void
 rdp_parse_bounds(STREAM s, BOUNDS * bounds)
 {
 	uint8 present;
@@ -127,12 +127,10 @@ rdp_parse_bounds(STREAM s, BOUNDS * bounds)
 		rdp_in_coord(s, &bounds->bottom, False);
 	else if (present & 128)
 		rdp_in_coord(s, &bounds->bottom, True);
-
-	return s_check(s);
 }
 
 /* Parse a pen */
-static RD_BOOL
+static void
 rdp_parse_pen(STREAM s, PEN * pen, uint32 present)
 {
 	if (present & 1)
@@ -143,8 +141,6 @@ rdp_parse_pen(STREAM s, PEN * pen, uint32 present)
 
 	if (present & 4)
 		rdp_in_colour(s, &pen->colour);
-
-	return s_check(s);
 }
 
 static void
@@ -176,7 +172,7 @@ setup_brush(BRUSH * out_brush, BRUSH * in_brush)
 }
 
 /* Parse a brush */
-static RD_BOOL
+static void
 rdp_parse_brush(STREAM s, BRUSH * brush, uint32 present)
 {
 	if (present & 1)
@@ -193,8 +189,6 @@ rdp_parse_brush(STREAM s, BRUSH * brush, uint32 present)
 
 	if (present & 16)
 		in_uint8a(s, &brush->pattern[1], 7);
-
-	return s_check(s);
 }
 
 /* Process a destination blt order */
@@ -826,6 +820,7 @@ process_ellipse2(STREAM s, ELLIPSE2_ORDER * os, uint32 present, RD_BOOL delta)
 static void
 process_text2(STREAM s, TEXT2_ORDER * os, uint32 present, RD_BOOL delta)
 {
+	UNUSED(delta);
 	BRUSH brush;
 
 	if (present & 0x000001)
@@ -1175,6 +1170,7 @@ process_compressed_8x8_brush_data(uint8 * in, uint8 * out, int Bpp)
 static void
 process_brushcache(STREAM s, uint16 flags)
 {
+	UNUSED(flags);
 	BRUSHDATA brush_data;
 	uint8 cache_idx, colour_code, width, height, size, type;
 	uint8 *comp_brush;
@@ -1253,16 +1249,27 @@ process_secondary_order(STREAM s)
 	/* The length isn't calculated correctly by the server.
 	 * For very compact orders the length becomes negative
 	 * so a signed integer must be used. */
-	uint16 length;
+	sint16 length;
 	uint16 flags;
 	uint8 type;
-	uint8 *next_order;
+	size_t next_order;
+	struct stream packet = *s;
 
 	in_uint16_le(s, length);
 	in_uint16_le(s, flags);	/* used by bmpcache2 */
 	in_uint8(s, type);
 
-	next_order = s->p + (sint16) length + 7;
+	length += 13;  /* MS-RDPEGDI is ridiculous and says that you need to add 13 to this
+			  field to get the total packet length. "For historical reasons". */
+	length -= 6;   /* Subtract six bytes of headers and you'll get the size of the remaining
+			  order data. */
+
+	if (!s_check_rem(s, length))
+	{
+		rdp_protocol_error("next order pointer would overrun stream", &packet);
+	}
+
+	next_order = s_tell(s) + length;
 
 	switch (type)
 	{
@@ -1299,7 +1306,7 @@ process_secondary_order(STREAM s)
 			       "process_secondary_order(), unhandled secondary order %d", type);
 	}
 
-	s->p = next_order;
+	s_seek(s, next_order);
 }
 
 /* Process an order PDU */
@@ -1441,9 +1448,9 @@ process_orders(STREAM s, uint16 num_orders)
 	}
 #if 0
 	/* not true when RDP_COMPRESSION is set */
-	if (s->p != g_next_packet)
+	if (s_tell(s) != g_next_packet)
 		logger(Graphics, Error, "process_orders(), %d bytes remaining",
-		       (int) (g_next_packet - s->p));
+		       (int) (g_next_packet - s_tell(s)));
 #endif
 
 }

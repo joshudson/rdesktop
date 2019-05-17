@@ -19,6 +19,13 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#ifndef _TYPES_H
+#define _TYPES_H
+
+#include <stdint.h>
+#include "constants.h"
+#include "stream.h"
+
 typedef int RD_BOOL;
 
 #ifndef True
@@ -36,6 +43,10 @@ typedef unsigned short uint16;
 typedef signed short sint16;
 typedef unsigned int uint32;
 typedef signed int sint32;
+typedef uint64_t uint64;
+typedef int64_t sint64;
+
+#define RD_UINT32_MAX (uint32)(-1)
 
 typedef void *RD_HBITMAP;
 typedef void *RD_HGLYPH;
@@ -208,9 +219,9 @@ typedef struct _DEVICE_FNS
 			      uint32 create_disposition, uint32 flags_and_attributes,
 			      char *filename, RD_NTHANDLE * handle);
 	RD_NTSTATUS(*close) (RD_NTHANDLE handle);
-	RD_NTSTATUS(*read) (RD_NTHANDLE handle, uint8 * data, uint32 length, uint32 offset,
+	RD_NTSTATUS(*read) (RD_NTHANDLE handle, uint8 * data, uint32 length, uint64 offset,
 			    uint32 * result);
-	RD_NTSTATUS(*write) (RD_NTHANDLE handle, uint8 * data, uint32 length, uint32 offset,
+	RD_NTSTATUS(*write) (RD_NTHANDLE handle, uint8 * data, uint32 length, uint64 offset,
 			     uint32 * result);
 	RD_NTSTATUS(*device_control) (RD_NTHANDLE handle, uint32 request, STREAM in, STREAM out);
 }
@@ -301,3 +312,13 @@ typedef struct fileinfo
 FILEINFO;
 
 typedef RD_BOOL(*str_handle_lines_t) (const char *line, void *data);
+
+typedef enum
+{
+	Fixed,
+	PercentageOfScreen,
+	Workarea,
+	Fullscreen,
+} window_size_type_t;
+
+#endif /* _TYPES_H */

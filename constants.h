@@ -2,6 +2,8 @@
    rdesktop: A Remote Desktop Protocol client.
    Miscellaneous protocol constants
    Copyright (C) Matthew Chapman 1999-2008
+   Copyright 2016 Alexander Zakharov <uglym8@gmail.com>
+   Copyright 2017-2018 Henrik Andersson <hean01@cendio.se> for Cendio AB
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -16,6 +18,9 @@
    You should have received a copy of the GNU General Public License
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
+
+#ifndef _CONSTANTS_H
+#define _CONSTANTS_H
 
 /* TCP port for Remote Desktop Protocol */
 #define TCP_PORT_RDP 3389
@@ -32,9 +37,6 @@
 
 #define FASTPATH_OUTPUT_SECURE_CHECKSUM 0x1
 #define FASTPATH_OUTPUT_ENCRYPTED       0x2
-
-#define IS_FASTPATH(hdr) ((hdr & 0x03) == FASTPATH_OUTPUT_ACTION_FASTPATH)
-#define IS_SLOWPATH(hdr) ((hdr) == FASTPATH_OUTPUT_ACTION_X224)
 
 /* [MS-RDPBCGR] 2.2.9.1.2.1 */
 /* adjusted for position in updateHeader */
@@ -123,6 +125,17 @@ enum MCS_PDU_TYPE
 #define MCS_GLOBAL_CHANNEL	1003
 #define MCS_USERCHANNEL_BASE    1001
 
+/* ITU-T Rec. T.125, Reason enumeration used with Disconnect Provider
+   Ultimatum, see mcs_send_dpu(reason) */
+enum MCS_DPU_REASON
+{
+	RN_DOMAIN_DISCONNECTED = 0,
+	RN_PROVIDER_INITIATED,
+	RN_TOKEN_PURGED,
+	RN_USER_REQUESTED,
+	RN_CHANNEL_PURGED,
+};
+
 /* RDP secure transport constants */
 #define SEC_RANDOM_SIZE		32
 #define SEC_MODULUS_SIZE	64
@@ -179,12 +192,12 @@ enum MCS_PDU_TYPE
 #define LICENCE_SIGNATURE_SIZE	16
 
 #define LICENCE_TAG_REQUEST                     0x01
-#define LICENCE_TAG_PLATFORM_CHALLANGE          0x02
+#define LICENCE_TAG_PLATFORM_CHALLENGE          0x02
 #define LICENCE_TAG_NEW_LICENCE                 0x03
 #define LICENCE_TAG_UPGRADE_LICENCE             0x04
 #define LICENCE_TAG_LICENCE_INFO                0x12
 #define LICENCE_TAG_NEW_LICENCE_REQUEST         0x13
-#define LICENCE_TAG_PLATFORM_CHALLANGE_RESPONSE 0x15
+#define LICENCE_TAG_PLATFORM_CHALLENGE_RESPONSE 0x15
 #define LICENCE_TAG_ERROR_ALERT                 0xff
 
 #define BB_CLIENT_USER_NAME_BLOB	0x000f
@@ -203,18 +216,18 @@ enum RDP_PDU_TYPE
 
 enum RDP_DATA_PDU_TYPE
 {
-	RDP_DATA_PDU_UPDATE = 2,
-	RDP_DATA_PDU_CONTROL = 20,
-	RDP_DATA_PDU_POINTER = 27,
-	RDP_DATA_PDU_INPUT = 28,
-	RDP_DATA_PDU_SYNCHRONISE = 31,
-	RDP_DATA_PDU_BELL = 34,
-	RDP_DATA_PDU_CLIENT_WINDOW_STATUS = 35,
-	RDP_DATA_PDU_LOGON = 38,	/* PDUTYPE2_SAVE_SESSION_INFO */
-	RDP_DATA_PDU_FONT2 = 39,
-	RDP_DATA_PDU_KEYBOARD_INDICATORS = 41,
-	RDP_DATA_PDU_DISCONNECT = 47,
-	RDP_DATA_PDU_AUTORECONNECT_STATUS = 50
+	RDP_DATA_PDU_UPDATE = 0x02,	/* PDUTYPE2_UPDATE */
+	RDP_DATA_PDU_CONTROL = 0x14,	/* PDUTYPE2_CONTROL */
+	RDP_DATA_PDU_POINTER = 0x1b,	/* PDUTYPE2_POINTER */
+	RDP_DATA_PDU_INPUT = 0x1c,	/* PDUTYPE2_INPUT */
+	RDP_DATA_PDU_SYNCHRONISE = 0x1f,	/* PDUTYPE2_SYNCHRONIZE */
+	RDP_DATA_PDU_BELL = 0x22,	/* PDUTYPE2_PLAY_SOUND */
+	RDP_DATA_PDU_CLIENT_WINDOW_STATUS = 0x23,	/* PDUTYPE2_SUPRESS_OUTPUT */
+	RDP_DATA_PDU_LOGON = 0x26,	/* PDUTYPE2_SAVE_SESSION_INFO */
+	RDP_DATA_PDU_FONT2 = 0x27,	/* PDUTYPE2_FONTLIST */
+	RDP_DATA_PDU_KEYBOARD_INDICATORS = 0x29,	/* PDUTYPE2_SET_KEYBOARD_INDICATORS */
+	RDP_DATA_PDU_SET_ERROR_INFO = 0x2f,	/* PDUTYPE2_SET_ERROR_INFO */
+	RDP_DATA_PDU_AUTORECONNECT_STATUS = 0x32,	/* PDUTYPE2_ARC_STATUS_PDU */
 };
 
 enum RDP_SAVE_SESSION_PDU_TYPE
@@ -259,7 +272,7 @@ enum RDP_POINTER_PDU_TYPE
 /* [MS-RDPBCGR] 2.2.9.1.1.4.3 */
 enum RDP_SYSTEM_POINTER_TYPE
 {
-	SYSPTR_NULL    = 0x00000000,
+	SYSPTR_NULL = 0x00000000,
 	SYSPTR_DEFAULT = 0x00007F00
 };
 
@@ -386,6 +399,9 @@ enum RDP_INPUT_DEVICE
 #define RDP_CAPSET_LARGE_POINTER	27
 #define RDP_CAPLEN_LARGE_POINTER	6
 
+#define RDP_CAPSET_VC	20
+#define RDP_CAPLEN_VC	0x08
+
 #define RDP_SOURCE		"MSTSC"
 
 /* Logon flags */
@@ -394,7 +410,7 @@ enum RDP_INPUT_DEVICE
 #define RDP_INFO_AUTOLOGON 	      0x00000008
 #define RDP_INFO_UNICODE              0x00000010
 #define RDP_INFO_MAXIMIZESHELL        0x00000020
-#define RDP_INFO_COMPRESSION	      0x00000080	/* mppc compression with 8kB histroy buffer */
+#define RDP_INFO_COMPRESSION	      0x00000080	/* mppc compression with 8kB history buffer */
 #define RDP_INFO_ENABLEWINDOWSKEY     0x00000100
 #define RDP_INFO_COMPRESSION2	      0x00000200	/* rdp5 mppc compression with 64kB history buffer */
 #define RDP_INFO_REMOTE_CONSOLE_AUDIO 0x00002000
@@ -508,6 +524,7 @@ enum RDP_INPUT_DEVICE
 #define RD_STATUS_NO_SUCH_FILE             0xc000000f
 #define RD_STATUS_INVALID_DEVICE_REQUEST   0xc0000010
 #define RD_STATUS_ACCESS_DENIED            0xc0000022
+#define RD_STATUS_BUFFER_TOO_SMALL         0xc0000023
 #define RD_STATUS_OBJECT_NAME_COLLISION    0xc0000035
 #define RD_STATUS_DISK_FULL                0xc000007f
 #define RD_STATUS_FILE_IS_A_DIRECTORY      0xc00000ba
@@ -600,6 +617,7 @@ enum RDP_INPUT_DEVICE
  * Named after the corresponding names on the server side:
  * https://msdn.microsoft.com/en-us/library/cc240544.aspx
  */
+#define ERRINFO_UNSET                                   (unsigned)(-1)
 #define ERRINFO_NO_INFO					0x0000
 #define ERRINFO_RPC_INITIATED_DISCONNECT		0x0001
 #define ERRINFO_RPC_INITIATED_LOGOFF			0x0002
@@ -682,7 +700,7 @@ enum RDP_PDU_REDIRECT_FLAGS
 	LB_TARGET_CERTIFICATE = 0x10000
 };
 
-/* desttop orientation */
+/* desktop orientation */
 enum RDP_DESKTOP_ORIENTATION
 {
 	ORIENTATION_LANDSCAPE = 0,
@@ -737,6 +755,9 @@ enum RDP_DESKTOP_ORIENTATION
 #define AUTORECONNECT_SUPPORTED		0x0008
 #define ENC_SALTED_CHECKSUM		0x0010
 #define NO_BITMAP_COMPRESSION_HDR	0x0400
+
+/* [MS-RDPBCGR], TS_BITMAP_DATA, flags */
+#define BITMAP_COMPRESSION              0x0001
 
 /* orderFlags, [MS-RDPBCGR] 2.2.7.1.3 */
 #define NEGOTIATEORDERSUPPORT	0x0002
@@ -793,3 +814,12 @@ enum RDP_DESKTOP_ORIENTATION
 
 /* [MS-RDPBCGR] 2.2.7.2.7 */
 #define LARGE_POINTER_FLAG_96x96	1
+
+/* [MS-RDPBCGR] TS_SUPPRESS_OUTPUT_PDU allowDisplayUpdates */
+enum RDP_SUPPRESS_STATUS
+{
+	SUPPRESS_DISPLAY_UPDATES = 0x00,
+	ALLOW_DISPLAY_UPDATES = 0x01
+};
+
+#endif /* _CONSTANTS_H */

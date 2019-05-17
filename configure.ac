@@ -1,4 +1,4 @@
-AC_INIT(rdesktop, 1.8.3post)
+AC_INIT(rdesktop, 1.8.99)
 
 AC_CONFIG_SRCDIR([rdesktop.c])
 
@@ -6,7 +6,7 @@ AC_CANONICAL_HOST
 
 AC_PROG_CC
 if test "$GCC" = yes; then
-    CFLAGS="$CFLAGS -Wall"
+    CFLAGS="$CFLAGS -Wall -Wextra"
 fi
 
 AC_PROG_INSTALL
@@ -26,8 +26,11 @@ if test "$no_x" = "yes"; then
     echo
     exit 1
 fi
-    
+
 AC_PATH_TOOL(PKG_CONFIG, pkg-config)
+
+# no .pc for GMP
+AC_SEARCH_LIBS([__gmpz_init], [gmp])
 
 AC_SEARCH_LIBS(socket, socket)
 AC_SEARCH_LIBS(inet_aton, resolv)
@@ -53,82 +56,14 @@ m4_ifdef([PKG_CHECK_MODULES], [], [
 
 dnl Add option to build with using address sanitizer
 AC_ARG_ENABLE([address-sanitizer], AS_HELP_STRING([--enable-address-sanitizer], \
-              [enabled AddressSanitizer support for detecting a wide variety of \
+              [enable AddressSanitizer support for detecting a wide variety of \
                memory allocation and deallocation errors]), \
               [AC_DEFINE(HAVE_ADDRESS_SANITIZER, 1, [enable AddressSanitizer])
-              CFLAGS="$CFLAGS -fsanitize=address"
+              CFLAGS="$CFLAGS -fsanitize=address -fno-omit-frame-pointer"
               AC_TRY_COMPILE([],[const int i=0;],[AC_MSG_NOTICE([Address Sanitizer Enabled])],
                                                  [AC_MSG_ERROR([Address Sanitizer not available])])
               ])
 
-#
-# OpenSSL detection borrowed from stunnel
-#
-checkssldir() { :
-    if test -f "$1/include/openssl/ssl.h"; then
-        ssldir="$1"
-        return 0
-    fi
-    return 1
-}
-AC_MSG_CHECKING([for OpenSSL directory])
-AC_ARG_WITH(openssl,
-    [  --with-openssl=DIR          look for OpenSSL at DIR/include, DIR/lib],
-    [
-        dnl Check the specified location only
-        checkssldir "$withval"
-    ],
-    [
-        dnl Search default locations of OpenSSL library
-        for maindir in /usr/local /usr/lib /usr/pkg /usr /var/ssl /opt; do
-            for dir in $maindir $maindir/openssl $maindir/ssl; do
-                checkssldir $dir && break 2
-            done
-        done
-    ]
-)
-if test -z "$ssldir"; then
-    AC_MSG_RESULT([Not found])
-    echo
-    echo "ERROR: Could not find OpenSSL headers/libraries."
-    if test -f /etc/debian_version; then
-       echo "Probably you need to install the libssl-dev package."
-    elif test -f /etc/redhat-release; then
-       echo "Probably you need to install the openssl-devel package."
-    fi
-    echo "To specify a path manually, use the --with-openssl option."
-    echo
-    exit 1
-fi
-AC_MSG_RESULT([$ssldir])
-AC_SUBST(ssldir)
-AC_DEFINE_UNQUOTED(ssldir, "$ssldir")
-
-dnl Add OpenSSL includes and libraries
-CFLAGS="$CFLAGS -I$ssldir/include"
-AC_ARG_ENABLE(static-openssl, 
-             [  --enable-static-openssl link OpenSSL statically],
-             [static_openssl=yes], 
-             [static_openssl=no])
-if test x"$static_openssl" = "xyes"; then
-    # OpenSSL generally relies on libz
-    AC_SEARCH_LIBS(deflate, z)
-    LIBS="-L$ssldir/lib -L$ssldir/lib64 -Wl,-Bstatic -lssl -lcrypto -Wl,-Bdynamic -ldl $LIBS"
-else
-    LIBS="-L$ssldir/lib -L$ssldir/lib64 -lssl -lcrypto -ldl $LIBS"
-
-    #
-    # target-specific stuff
-    #
-    case "$host" in
-    *-*-solaris*)
-        LDFLAGS="$LDFLAGS -R$ssldir/lib"
-        ;;
-    *-dec-osf*)
-        LDFLAGS="$LDFLAGS -Wl,-rpath,$ssldir/lib"
-        ;;
-    esac
-fi
 
 dnl CredSSP feature
 AC_ARG_ENABLE([credssp], AS_HELP_STRING([--disable-credssp], [disable support for CredSSP]))
@@ -140,8 +75,21 @@ AS_IF([test "x$enable_credssp" != "xno"], [
 		GSSAPI_LIBS="-framework Kerberos"
 		;;
 	     *)
-		if test -n "$PKG_CONFIG"; then
-		  PKG_CHECK_MODULES(GSSAPI, krb5-gssapi, [WITH_CREDSSP=1], [WITH_CREDSSP=0])
+		#if 'OSTYPE' is not set use 'host' instead
+		if test x"$OSTYPE" = "x"; then
+			case "$host" in
+				*-*-freebsd*)
+				if test -n "$PKG_CONFIG"; then
+					PKG_CHECK_MODULES(GSSAPI, gss, [WITH_CREDSSP=1], [WITH_CREDSSP=0])
+				fi
+				;;
+			*)
+				;;
+			esac
+		else
+			if test -n "$PKG_CONFIG"; then
+				PKG_CHECK_MODULES(GSSAPI, krb5-gssapi, [WITH_CREDSSP=1], [WITH_CREDSSP=0])
+			fi
 		fi
 		;;
 	esac
@@ -188,6 +136,62 @@ else
     exit 1
 fi
 
+# libtasn1
+if test -n "$PKG_CONFIG"; then
+    PKG_CHECK_MODULES(LIBTASN1, libtasn1, [HAVE_LIBTASN1=1], [HAVE_LIBTASN1=0])
+fi
+if test x"$HAVE_LIBTASN1" = "x1"; then
+    CFLAGS="$CFLAGS $LIBTASN1_CFLAGS"
+    LIBS="$LIBS $LIBTASN1_LIBS"
+else
+	   echo
+	   echo "rdesktop requires libtasn1. Please install the dependency"
+	   echo
+	   exit 1
+fi
+
+# nettle
+if test -n "$PKG_CONFIG"; then
+    PKG_CHECK_MODULES(NETTLE, nettle, [HAVE_NETTLE=1], [HAVE_NETTLE=0])
+fi
+if test x"$HAVE_NETTLE" = "x1"; then
+    CFLAGS="$CFLAGS $NETTLE_CFLAGS"
+    LIBS="$LIBS $NETTLE_LIBS"
+else
+	   echo
+	   echo "rdesktop requires Nettle. Please install the dependency"
+	   echo
+	   exit 1
+fi
+
+# hogweed
+if test -n "$PKG_CONFIG"; then
+    PKG_CHECK_MODULES(HOGWEED, hogweed, [HAVE_HOGWEED=1], [HAVE_HOGWEED=0])
+fi
+if test x"$HAVE_HOGWEED" = "x1"; then
+    CFLAGS="$CFLAGS $HOGWEED_CFLAGS"
+    LIBS="$LIBS $HOGWEED_LIBS"
+else
+	   echo
+	   echo "rdesktop requires hogweed. Please install the dependency"
+	   echo
+	   exit 1
+fi
+
+# GnuTLS
+
+if test -n "$PKG_CONFIG"; then
+    PKG_CHECK_MODULES(GNUTLS, gnutls >= 3.2.0, [HAVE_GNUTLS=1], [HAVE_GNUTLS=0])
+fi
+if test x"$HAVE_GNUTLS" = "x1"; then
+    CFLAGS="$CFLAGS $GNUTLS_CFLAGS"
+    LIBS="$LIBS $GNUTLS_LIBS"
+else
+	   echo
+	   echo "rdesktop requires GnuTLS. Please install the dependency"
+	   echo
+	   exit 1
+fi
 
 dnl Smartcard support
 AC_ARG_ENABLE(smartcard, AS_HELP_STRING([--disable-smartcard], [disable support for smartcard]))
@@ -217,6 +221,10 @@ AS_IF([test "x$enable_smartcard" != "xno"], [
 	   echo
 	   exit 1
 	fi
+
+	AC_MSG_CHECKING([for PCSC-lite >= 1.6.0 (PnP/Notifications support)])
+	PKG_CHECK_MODULES(PNP_NOTIFICATIONS, libpcsclite >= 1.6.0, [WITH_PNP_NOTIFICATIONS=1], [WITH_PNP_NOTIFICATIONS=0])
+	AC_DEFINE(WITH_PNP_NOTIFICATIONS)
 
 	AC_MSG_CHECKING([for old version of PCSC])
 	AC_TRY_LINK([
@@ -251,11 +259,11 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	return 0;
-}], 
- [AC_MSG_RESULT(no)], 
- [AC_MSG_RESULT(yes) 
-  AC_DEFINE(NEED_ALIGN)], 
- [AC_MSG_RESULT(assuming yes) 
+}],
+ [AC_MSG_RESULT(no)],
+ [AC_MSG_RESULT(yes)
+  AC_DEFINE(NEED_ALIGN)],
+ [AC_MSG_RESULT(assuming yes)
   AC_DEFINE(NEED_ALIGN)])
 
 
@@ -276,22 +284,23 @@ AC_DEFINE_UNQUOTED(EGD_SOCKET, "$EGD_SOCKET")
 
 sound="yes"
 AC_ARG_WITH(sound,
-    [  --with-sound            select sound system ("oss", "sgi", "sun", "alsa" or "libao") ],
-    [ 
-    sound="$withval" 
+    [  --with-sound            select sound system ("oss", "sgi", "sun", "alsa", "pulse" or "libao") ],
+    [
+    sound="$withval"
     ])
 
 AC_CHECK_HEADER(sys/soundcard.h, [HAVE_OSS=1], [HAVE_OSS=0])
 AC_CHECK_HEADER(dmedia/audio.h, [HAVE_SGI=1], [HAVE_SGI=0])
 AC_CHECK_HEADER(sys/audioio.h, [HAVE_SUN=1], [HAVE_SUN=0])
 
-AC_ARG_ENABLE(static-libsamplerate, 
-    [  --enable-static-libsamplerate link libsamplerate statically], 
-    [static_libsamplerate=yes], 
+AC_ARG_ENABLE(static-libsamplerate,
+    [  --enable-static-libsamplerate link libsamplerate statically],
+    [static_libsamplerate=yes],
     [static_libsamplerate=no])
 
 if test -n "$PKG_CONFIG"; then
     PKG_CHECK_MODULES(LIBAO, ao, [HAVE_LIBAO=1], [HAVE_LIBAO=0])
+    PKG_CHECK_MODULES(PULSE, libpulse, [HAVE_PULSE=1], [HAVE_PULSE=0])
     PKG_CHECK_MODULES(ALSA, alsa, [HAVE_ALSA=1], [HAVE_ALSA=0])
     PKG_CHECK_MODULES(LIBSAMPLERATE, samplerate, [HAVE_LIBSAMPLERATE=1], [HAVE_LIBSAMPLERATE=0])
     if test x"$HAVE_LIBSAMPLERATE" = "x1"; then
@@ -334,6 +343,13 @@ case $sound in
             CFLAGS="$CFLAGS $ALSA_CFLAGS"
             LIBS="$LIBS $ALSA_LIBS"
             AC_DEFINE(RDPSND_ALSA)
+        fi
+
+        if test x"$HAVE_PULSE" = "x1"; then
+            SOUNDOBJ="$SOUNDOBJ rdpsnd_pulse.o"
+            CFLAGS="$CFLAGS $PULSE_CFLAGS"
+            LIBS="$LIBS $PULSE_LIBS"
+            AC_DEFINE(RDPSND_PULSE)
         fi
 
         if test x"$HAVE_LIBAO" = "x1"; then
@@ -384,6 +400,17 @@ case $sound in
         fi
         ;;
 
+    pulse)
+        if test x"$HAVE_PULSE" = "x1"; then
+            SOUNDOBJ="$SOUNDOBJ rdpsnd_pulse.o"
+            CFLAGS="$CFLAGS $PULSE_CFLAGS"
+            LIBS="$LIBS $PULSE_LIBS"
+            AC_DEFINE(RDPSND_PULSE)
+        else
+            AC_MSG_ERROR([Selected sound system is not available.])
+        fi
+        ;;
+
     libao)
         if test x"$HAVE_LIBAO" = "x1"; then
             SOUNDOBJ="$SOUNDOBJ rdpsnd_libao.o"
@@ -400,7 +427,7 @@ case $sound in
 
     *)
         AC_MSG_WARN([sound support disabled])
-        AC_MSG_WARN([Currently supported systems are Open Sound System (oss), SGI AL (sgi), Sun/BSD (sun), ALSA (alsa) and libao])
+        AC_MSG_WARN([Currently supported systems are Open Sound System (oss), SGI AL (sgi), Sun/BSD (sun), ALSA (alsa), PulseAudio (pulse) and libao])
         ;;
 esac
 
@@ -860,7 +887,7 @@ AC_CHECK_FUNCS(setmntent)
 #
 AC_ARG_WITH(ipv6,
     [  --with-ipv6             enable IPv6-support],
-    [ 
+    [
         if test $withval != "no";
         then
 	    AC_DEFINE(IPv6,1)

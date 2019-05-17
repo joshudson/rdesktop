@@ -4,7 +4,8 @@
    Copyright (C) Matthew Chapman <matthewc.unsw.edu.au> 1999-2008
    Copyright 2007-2008 Pierre Ossman <ossman@cendio.se> for Cendio AB
    Copyright 2002-2011 Peter Astrand <astrand@cendio.se> for Cendio AB
-   Copyright 2012-2017 Henrik Andersson <hean01@cendio.se> for Cendio AB
+   Copyright 2012-2018 Henrik Andersson <hean01@cendio.se> for Cendio AB
+   Copyright 2017-2019 Alexander Zakharov <uglym8@gmail.com>
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -49,9 +50,23 @@ extern void SurgeAdjustImage(XImage *image);
 #define HOST_NAME_MAX MAXHOSTNAMELEN
 #endif
 
-extern int g_sizeopt;
-extern int g_width;
-extern int g_height;
+#ifdef __sun
+#include <netdb.h>
+#define HOST_NAME_MAX MAXHOSTNAMELEN
+#endif
+
+#ifdef __FreeBSD__
+#define HOST_NAME_MAX _POSIX_HOST_NAME_MAX
+#endif
+
+extern RD_BOOL g_user_quit;
+extern RD_BOOL g_exit_mainloop;
+
+extern window_size_type_t g_window_size_type;
+extern uint32 g_requested_session_width;
+extern uint32 g_requested_session_height;
+extern uint16 g_session_width;
+extern uint16 g_session_height;
 extern int g_xpos;
 extern int g_ypos;
 extern int g_pos;
@@ -60,6 +75,9 @@ extern RD_BOOL g_fullscreen;
 extern RD_BOOL g_grab_keyboard;
 extern RD_BOOL g_hide_decorations;
 extern RD_BOOL g_pending_resize;
+extern RD_BOOL g_pending_resize_defer;
+extern struct timeval g_pending_resize_defer_timer;
+
 extern char g_title[];
 extern char g_seamless_spawn_cmd[];
 /* Color depth of the RDP session.
@@ -67,11 +85,22 @@ extern char g_seamless_spawn_cmd[];
 extern int g_server_depth;
 extern int g_win_button_size;
 
+/* This is a timer used to rate limit actual resizing */
+static struct timeval g_resize_timer = { 0 };
+
 Display *g_display;
 Time g_last_gesturetime;
 static int g_x_socket;
 static Screen *g_screen;
 Window g_wnd;
+
+static RD_BOOL g_has_wm = False;
+
+RD_BOOL g_dynamic_session_resize = True;
+
+/* These are the last known window sizes. They are updated whenever the window size is changed. */
+static uint32 g_window_width;
+static uint32 g_window_height;
 
 /* SeamlessRDP support */
 typedef struct _seamless_group
@@ -106,7 +135,7 @@ typedef struct _seamless_window
 static seamless_window *g_seamless_windows = NULL;
 static unsigned long g_seamless_focused = 0;
 static RD_BOOL g_seamless_started = False;	/* Server end is up and running */
-static RD_BOOL g_seamless_active = False;	/* We are currently in seamless mode */
+RD_BOOL g_seamless_active = False;	/* We are currently in seamless mode */
 static RD_BOOL g_seamless_hidden = False;	/* Desktop is hidden on server */
 static RD_BOOL g_seamless_broken_restack = False;	/* WM does not properly restack */
 extern RD_BOOL g_seamless_rdp;
@@ -158,7 +187,7 @@ static RD_BOOL g_compatible_arch;
      RDP(LE) <-> host(BE) <-> X-Server(LE)
      
    ('host' is the machine running rdesktop; the host simply memcpy's
-    so its endianess doesn't matter)
+    so its endianness doesn't matter)
  */
 static RD_BOOL g_no_translate_image = False;
 
@@ -609,9 +638,9 @@ sw_configurenotify_p(Display * display, XEvent * xevent, XPointer arg)
    throwing away crucial events like DestroyNotify. 
 
    After a ConfigureWindow, according to ICCCM section 4.1.5, we
-   should recieve a ConfigureNotify, either a real or synthetic
+   should receive a ConfigureNotify, either a real or synthetic
    one. This indicates that the configure has been "completed".
-   However, some WMs such as several versions of Metacity fails to
+   However, some WMs such as several versions of Metacity fail to
    send synthetic events. See bug
    http://bugzilla.gnome.org/show_bug.cgi?id=322840. We need to use a
    timeout to avoid a hang. Tk uses the same approach. */
@@ -906,7 +935,7 @@ translate_colour(uint32 colour)
 /* *INDENT-OFF* */
 
 /* repeat and unroll, similar to bitmap.c */
-/* potentialy any of the following translate */
+/* potentially any of the following translate */
 /* functions can use repeat but just doing */
 /* the most common ones */
 
@@ -1589,7 +1618,9 @@ xwin_refresh_pointer_map(void)
 	int i;
 	unsigned int pointer_buttons;
 
-	pointer_buttons = (unsigned int)XGetPointerMapping(g_display, phys_to_log_map, sizeof(phys_to_log_map));
+	pointer_buttons =
+		(unsigned int) XGetPointerMapping(g_display, phys_to_log_map,
+						  sizeof(phys_to_log_map));
 	if (pointer_buttons > sizeof(phys_to_log_map))
 		pointer_buttons = sizeof(phys_to_log_map);
 
@@ -1894,13 +1925,74 @@ set_wm_client_machine(Display * dpy, Window win)
 	if (gethostname(hostname, sizeof(hostname)) != 0)
 		return;
 
-	tp.value = (unsigned char *)hostname;
+	tp.value = (unsigned char *) hostname;
 	tp.nitems = strlen(hostname);
 	tp.encoding = XA_STRING;
 	tp.format = 8;
 
 	XSetWMClientMachine(dpy, win, &tp);
 }
+
+RD_BOOL is_wm_active(void)
+{
+	Atom prop, actual_type;
+	int actual_fmt;
+	unsigned long nitems, bytes_left;
+	unsigned char *data;
+	Window wid;
+
+	prop = XInternAtom(g_display, "_NET_SUPPORTING_WM_CHECK", True);
+
+	if (prop == None) return False;
+
+	if (XGetWindowProperty(g_display, DefaultRootWindow(g_display), prop, 0, 1, False,
+				XA_WINDOW, &actual_type, &actual_fmt, &nitems, &bytes_left, &data) != Success) {
+		return False;
+	}
+
+	if (!nitems) {
+		XFree(data);
+		return False;
+	}
+
+	wid = ((Window *)data)[0];
+	XFree(data);
+
+	if (XGetWindowProperty(g_display, wid, prop, 0, 1, False,
+				XA_WINDOW, &actual_type, &actual_fmt, &nitems, &bytes_left, &data) != Success) {
+		return False;
+	}
+
+	if (!nitems) {
+		XFree(data);
+		return False;
+	}
+
+	if (wid != ((Window *)data)[0]) {
+		XFree(data);
+		return False;
+	}
+
+	XFree(data);
+
+	/* Just for the curious minds */
+	prop = XInternAtom(g_display, "_NET_WM_NAME", True);
+
+	if (prop == None) return False;
+
+
+	if (XGetWindowProperty(g_display, wid, prop, 0, 1, False,
+				AnyPropertyType, &actual_type, &actual_fmt, &nitems, &bytes_left, &data) == Success) {
+		if (nitems) {
+			logger(GUI, Verbose, "%s(): WM name: %s", __func__, data);
+		}
+
+		XFree(data);
+	}
+
+	return True;
+}
+
 
 /* Initialize the UI. This is done once per process. */
 RD_BOOL
@@ -1916,8 +2008,8 @@ ui_init(void)
 	}
 
 	{
-		uint16 endianess_test = 1;
-		g_host_be = !(RD_BOOL) (*(uint8 *) (&endianess_test));
+		uint16 endianness_test = 1;
+		g_host_be = !(RD_BOOL) (*(uint8 *) (&endianness_test));
 	}
 
 	g_old_error_handler = XSetErrorHandler(error_handler);
@@ -1979,61 +2071,43 @@ ui_init(void)
 		seamless_init();
 	}
 
+	g_has_wm = is_wm_active();
+
 	return True;
 }
 
-
-/* 
-   Initialize connection specific data, such as session size. 
- */
 void
-ui_init_connection(void)
+ui_get_screen_size(uint32 * width, uint32 * height)
 {
-	/*
-	 * Determine desktop size
-	 */
-	if (g_fullscreen)
+	*width = WidthOfScreen(g_screen);
+	*height = HeightOfScreen(g_screen);
+}
+
+void
+ui_get_screen_size_from_percentage(uint32 pw, uint32 ph, uint32 * width, uint32 * height)
+{
+	uint32 sw, sh;
+	ui_get_screen_size(&sw, &sh);
+	*width = sw * pw / 100;
+	*height = sh * ph / 100;
+}
+
+void
+ui_get_workarea_size(uint32 * width, uint32 * height)
+{
+	uint32 x, y, w, h;
+	if (get_current_workarea(&x, &y, &w, &h) == 0)
 	{
-		g_width = WidthOfScreen(g_screen);
-		g_height = HeightOfScreen(g_screen);
+		*width = w;
+		*height = h;
 		g_using_full_workarea = True;
 	}
-	else if (g_sizeopt < 0)
+	else
 	{
-		/* Percent of screen */
-		if (-g_sizeopt >= 100)
-			g_using_full_workarea = True;
-
-		if (g_width > 0)
-			g_width = g_sizeopt;
-
-		if (g_height > 0)
-			g_height = g_sizeopt;
-
-		g_height = HeightOfScreen(g_screen) * (-g_height) / 100;
-		g_width = WidthOfScreen(g_screen) * (-g_width) / 100;
+		logger(GUI, Warning,
+		       "Failed to get workarea: probably your window manager does not support extended hints, using full screensize as fallback\n");
+		ui_get_screen_size(width, height);
 	}
-	else if (g_sizeopt == 1)
-	{
-		/* Fetch geometry from _NET_WORKAREA */
-		uint32 x, y, cx, cy;
-		if (get_current_workarea(&x, &y, &cx, &cy) == 0)
-		{
-			g_width = cx;
-			g_height = cy;
-			g_using_full_workarea = True;
-		}
-		else
-		{
-			logger(GUI, Warning,
-			       "Failed to get workarea: probably your window manager does not support extended hints\n");
-			g_width = WidthOfScreen(g_screen);
-			g_height = HeightOfScreen(g_screen);
-		}
-	}
-
-	/* make sure width is a multiple of 4 */
-	g_width = (g_width + 3) & ~3;
 }
 
 
@@ -2046,7 +2120,7 @@ ui_deinit(void)
 		XCloseIM(g_IM);
 
 	if (g_null_cursor != NULL)
-		ui_destroy_cursor(g_null_cursor);
+		XFreeCursor(g_display, (Cursor) g_null_cursor);
 
 	XFreeModifiermap(g_mod_map);
 
@@ -2056,14 +2130,30 @@ ui_deinit(void)
 }
 
 
-static void
+static unsigned long
 get_window_attribs(XSetWindowAttributes * attribs)
 {
+	unsigned long vmask = 0;
+
+	vmask = CWBackPixel | CWBorderPixel | CWBackingStore | CWOverrideRedirect | CWColormap;
+
 	attribs->background_pixel = BlackPixelOfScreen(g_screen);
 	attribs->border_pixel = WhitePixelOfScreen(g_screen);
 	attribs->backing_store = g_ownbackstore ? NotUseful : Always;
-	attribs->override_redirect = g_fullscreen;
+	if (g_has_wm) {
+		attribs->override_redirect = 0;
+	} else {
+		attribs->override_redirect = g_fullscreen;
+	}
 	attribs->colormap = g_xcolmap;
+
+	return vmask;
+}
+
+static unsigned long
+get_window_attribs_seamless(XSetWindowAttributes * attribs)
+{
+	return (get_window_attribs(attribs) & ~CWOverrideRedirect);
 }
 
 static void
@@ -2082,8 +2172,58 @@ get_input_mask(long *input_mask)
 		*input_mask |= LeaveWindowMask;
 }
 
+static void
+get_sizehints(XSizeHints * sizehints, uint32 width, uint32 height)
+{
+	if (sizehints == NULL)
+		return;
+
+	/* user specified position, this is needed to override the choice of
+	   window position by window manager when a window is mapped. */
+	sizehints->flags = USPosition;
+
+	/* set minimal size of rdesktop main window */
+	sizehints->flags |= PMinSize;
+	sizehints->min_width = 200;
+	sizehints->min_height = 200;
+
+	/* resize increment */
+	sizehints->flags |= PResizeInc;
+	sizehints->width_inc = 2;	/* session width must be divisible by two */
+	sizehints->height_inc = 1;
+
+	if (g_seamless_rdp || !g_dynamic_session_resize)
+	{
+		/* disable dynamic session resize based on window size for
+		   rdesktop main window when seamless is enabled */
+		sizehints->flags |= PMaxSize;
+		sizehints->min_width = sizehints->max_width = width;
+		sizehints->min_height = sizehints->max_height = height;
+	}
+}
+
+void
+ui_update_window_sizehints(uint32 width, uint32 height)
+{
+	XSizeHints *sizehints;
+	sizehints = XAllocSizeHints();
+	if (sizehints)
+	{
+		get_sizehints(sizehints, width, height);
+		XSetWMNormalHints(g_display, g_wnd, sizehints);
+		XFree(sizehints);
+	}
+}
+
+void request_wm_fullscreen(Display *dpy, Window win)
+{
+	Atom atom = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
+	XChangeProperty(dpy, win, XInternAtom(dpy, "_NET_WM_STATE", False), XA_ATOM, 32, PropModeReplace, (unsigned char *)&atom, 1);
+	XFlush(dpy);
+}
+
 RD_BOOL
-ui_create_window(void)
+ui_create_window(uint32 width, uint32 height)
 {
 	uint8 null_pointer_mask[1] = { 0x80 };
 	uint8 null_pointer_data[24] = { 0x00 };
@@ -2091,25 +2231,27 @@ ui_create_window(void)
 	XSetWindowAttributes attribs;
 	XClassHint *classhints;
 	XSizeHints *sizehints;
-	int wndwidth, wndheight;
+	unsigned long value_mask;
 	long input_mask, ic_input_mask;
 	XEvent xevent;
 
-	wndwidth = g_fullscreen ? WidthOfScreen(g_screen) : g_width;
-	wndheight = g_fullscreen ? HeightOfScreen(g_screen) : g_height;
+	/* reset stored window sizes */
+	g_window_width = 0;
+	g_window_height = 0;
+
+	logger(GUI, Debug, "ui_create_window() width = %d, height = %d", width, height);
 
 	/* Handle -x-y portion of geometry string */
 	if (g_xpos < 0 || (g_xpos == 0 && (g_pos & 2)))
-		g_xpos = WidthOfScreen(g_screen) + g_xpos - g_width;
+		g_xpos = WidthOfScreen(g_screen) + g_xpos - width;
 	if (g_ypos < 0 || (g_ypos == 0 && (g_pos & 4)))
-		g_ypos = HeightOfScreen(g_screen) + g_ypos - g_height;
+		g_ypos = HeightOfScreen(g_screen) + g_ypos - height;
 
-	get_window_attribs(&attribs);
+	value_mask = get_window_attribs(&attribs);
 
-	g_wnd = XCreateWindow(g_display, RootWindowOfScreen(g_screen), g_xpos, g_ypos, wndwidth,
-			      wndheight, 0, g_depth, InputOutput, g_visual,
-			      CWBackPixel | CWBackingStore | CWOverrideRedirect | CWColormap |
-			      CWBorderPixel, &attribs);
+	g_wnd = XCreateWindow(g_display, RootWindowOfScreen(g_screen), g_xpos, g_ypos, width,
+			      height, 0, g_depth, InputOutput, g_visual, value_mask, &attribs);
+
 	ewmh_set_wm_pid(g_wnd, getpid());
 	set_wm_client_machine(g_display, g_wnd);
 
@@ -2124,17 +2266,17 @@ ui_create_window(void)
 
 	if ((g_ownbackstore) && (g_backstore == 0))
 	{
-		g_backstore = XCreatePixmap(g_display, g_wnd, g_width, g_height, g_depth);
+		g_backstore = XCreatePixmap(g_display, g_wnd, width, height, g_depth);
 
 		/* clear to prevent rubbish being exposed at startup */
 		XSetForeground(g_display, g_gc, BlackPixelOfScreen(g_screen));
-		XFillRectangle(g_display, g_backstore, g_gc, 0, 0, g_width, g_height);
+		XFillRectangle(g_display, g_backstore, g_gc, 0, 0, width, height);
 
 		if (g_surge >= 0)
 		{
 			int localdepth = 24;
-			g_backstore3 = XCreatePixmap(g_display, g_wnd, g_width, g_height, g_depth);
-			XFillRectangle(g_display, g_backstore3, g_gc, 0, 0, g_width, g_height);
+			g_backstore3 = XCreatePixmap(g_display, g_wnd, width, height, g_depth);
+			XFillRectangle(g_display, g_backstore3, g_gc, 0, 0, width, height);
 
 			/* This way of detecting depth works, but can return 32 when 24 must be used. */
 			g_backstore2 = XGetImage(g_display, RootWindow(g_display, 0), 0, 0, 4, 4,
@@ -2149,7 +2291,7 @@ ui_create_window(void)
 			XFlush(g_display);
 			if (XShmQueryExtension(g_display))
 				g_backstore2 = XShmCreateImage(g_display, g_visual, localdepth > 24 ? 24 : localdepth,
-					ZPixmap, NULL, &g_backstore2_shminfo, g_width, g_height);
+					ZPixmap, NULL, &g_backstore2_shminfo, width, height);
 			if (g_backstore2 != NULL) {
 				g_backstore2_shminfo.shmid = shmget(IPC_PRIVATE,
 					g_backstore2->bytes_per_line * g_backstore2->height, IPC_CREAT|0777);
@@ -2187,11 +2329,7 @@ ui_create_window(void)
 	sizehints = XAllocSizeHints();
 	if (sizehints)
 	{
-		sizehints->flags = PMinSize | PMaxSize;
-		if (g_pos)
-			sizehints->flags |= PPosition;
-		sizehints->min_width = sizehints->max_width = g_width;
-		sizehints->min_height = sizehints->max_height = g_height;
+		get_sizehints(sizehints, width, height);
 		XSetWMNormalHints(g_display, g_wnd, sizehints);
 		XFree(sizehints);
 	}
@@ -2217,6 +2355,9 @@ ui_create_window(void)
 #ifdef HAVE_XRANDR
 	XSelectInput(g_display, RootWindowOfScreen(g_screen), StructureNotifyMask);
 #endif
+	if (g_fullscreen && g_has_wm) {
+		request_wm_fullscreen(g_display, g_wnd);
+	}
 	XMapWindow(g_display, g_wnd);
 
 	/* wait for VisibilityNotify */
@@ -2256,24 +2397,35 @@ ui_create_window(void)
 }
 
 void
-ui_resize_window()
+ui_resize_window(uint32 width, uint32 height)
 {
+	XWindowAttributes attr;
 	XSizeHints *sizehints;
 	Pixmap bs;
+
+	XGetWindowAttributes(g_display, g_wnd, &attr);
+
+	if ((attr.width == (int) width && attr.height == (int) height))
+	{
+		/* no-op */
+		return;
+	}
+
+	logger(GUI, Debug,
+	       "ui_resize_window(), Changing window %dx%d to match new session %dx%d size",
+	       attr.width, attr.height, width, height);
 
 	sizehints = XAllocSizeHints();
 	if (sizehints)
 	{
-		sizehints->flags = PMinSize | PMaxSize;
-		sizehints->min_width = sizehints->max_width = g_width;
-		sizehints->min_height = sizehints->max_height = g_height;
+		get_sizehints(sizehints, width, height);
 		XSetWMNormalHints(g_display, g_wnd, sizehints);
 		XFree(sizehints);
 	}
 
-	if (!(g_fullscreen || g_embed_wnd))
+	if (!g_embed_wnd)
 	{
-		XResizeWindow(g_display, g_wnd, g_width, g_height);
+		XResizeWindow(g_display, g_wnd, width, height);
 	}
 
 	/* create new backstore pixmap */
@@ -2284,14 +2436,15 @@ ui_resize_window()
 			/* TODO FIXME */
 			exit(3);
 		}
-		bs = XCreatePixmap(g_display, g_wnd, g_width, g_height, g_depth);
+		bs = XCreatePixmap(g_display, g_wnd, width, height, g_depth);
 		XSetForeground(g_display, g_gc, BlackPixelOfScreen(g_screen));
-		XFillRectangle(g_display, bs, g_gc, 0, 0, g_width, g_height);
-		XCopyArea(g_display, g_backstore, bs, g_gc, 0, 0, g_width, g_height, 0, 0);
+		XFillRectangle(g_display, bs, g_gc, 0, 0, width, height);
+		XCopyArea(g_display, g_backstore, bs, g_gc, 0, 0, width, height, 0, 0);
 		XFreePixmap(g_display, g_backstore);
 		g_backstore = bs;
 	}
 
+	ui_set_clip(0, 0, width, height);
 }
 
 RD_BOOL
@@ -2330,28 +2483,109 @@ ui_destroy_window(void)
 void
 xwin_toggle_fullscreen(void)
 {
+	uint32 x, y, width, height;
+	XWindowAttributes attr;
 	Pixmap contents = 0;
+	Window unused;
+	int dest_x, dest_y;
+	static uint32 windowed_x = 0;
+	static uint32 windowed_y = 0;
+	static uint32 windowed_height = 0;
+	static uint32 windowed_width = 0;
 
-	if (g_seamless_active)
-		/* Turn off SeamlessRDP mode */
-		ui_seamless_toggle();
+	/* When running rdesktop in seamless mode, toggling of fullscreen is not allowed */
+	if (g_seamless_rdp)
+		return;
+
+	/* get current window size and store it to be used when switching back
+	 * from fullscreen mode.
+	 */
+	XGetWindowAttributes(g_display, g_wnd, &attr);
+
+	if (!g_fullscreen || (windowed_width == 0 || windowed_height == 0))
+	{
+		/* only stored if we toggle from windowed -> fullscreen or when
+		 * going from fullscreen -> windowed when started in fullscreen mode.
+		 */
+
+		XTranslateCoordinates(g_display, g_wnd,
+				      DefaultRootWindow(g_display),
+				      0, 0, &dest_x, &dest_y, &unused);
+
+		windowed_x = dest_x;
+		windowed_y = dest_y;
+		windowed_width = attr.width;
+		windowed_height = attr.height;
+	}
 
 	if (!g_ownbackstore)
 	{
-		/* need to save contents of window */
-		contents = XCreatePixmap(g_display, g_wnd, g_width, g_height, g_depth);
-		XCopyArea(g_display, g_wnd, contents, g_gc, 0, 0, g_width, g_height, 0, 0);
+		/* need to save contents of current window */
+		contents = XCreatePixmap(g_display, g_wnd, attr.width, attr.height, g_depth);
+		XCopyArea(g_display, g_wnd, contents, g_gc, 0, 0, attr.width, attr.height, 0, 0);
 	}
 
-	ui_destroy_window();
 	g_fullscreen = !g_fullscreen;
-	ui_create_window();
+
+
+	/* What size should the new window have? */
+	if (g_fullscreen)
+	{
+		/* Since we need to create a fullscreen window we need to know screen size */
+		x = 0;
+		y = 0;
+		width = WidthOfScreen(g_screen);
+		height = HeightOfScreen(g_screen);
+	}
+	else
+	{
+		/* Switch from fullscreen to window mode */
+		x = windowed_x;
+		y = windowed_y;
+
+		if (g_dynamic_session_resize)
+		{
+			/* Restore "old" window size, resize session to fit */
+			width = windowed_width;
+			height = windowed_height;
+		}
+		else
+		{
+			/* Resize window to fit session size */
+			width = g_session_width;
+			height = g_session_height;
+		}
+	}
+
+	logger(GUI, Debug, "xwin_toggle_fullscreen(), new window: %dx%d+%d+%d, last window: %dx%d",
+	       width, height, x, y, windowed_width, windowed_height);
+
+	/* Re-create the rdesktop window using new size and window
+	   attributes. */
+	g_xpos = x;
+	g_ypos = y;
+	ui_destroy_window();
+	ui_create_window(width, height);
+
+	/* If the window manager overrides our window size request, we trust
+	   the normal window resize mechanism to take care of resizing the
+	   session. When window is configured as override-redirect
+	   (i.e. fullscreen), this disables the normal window resize
+	   mechanism. In that case, we have to take care of the resize
+	   ourselves setting g_pending_resize. */
+	if (g_fullscreen)
+	{
+		g_pending_resize = True;
+		g_window_width = width;
+		g_window_height = height;
+	}
 
 	XDefineCursor(g_display, g_wnd, g_current_cursor);
 
 	if (!g_ownbackstore)
 	{
-		XCopyArea(g_display, contents, g_wnd, g_gc, 0, 0, g_width, g_height, 0, 0);
+		/* copy back saved contents into new window */
+		XCopyArea(g_display, contents, g_wnd, g_gc, 0, 0, attr.width, attr.height, 0, 0);
 		XFreePixmap(g_display, contents);
 	}
 }
@@ -2359,7 +2593,11 @@ xwin_toggle_fullscreen(void)
 static void
 handle_button_event(XEvent xevent, RD_BOOL down)
 {
+	XWindowAttributes attr;
 	uint16 button, input_type, flags = 0;
+
+	XGetWindowAttributes(g_display, g_wnd, &attr);
+
 	g_last_gesturetime = xevent.xbutton.time;
 	/* Reverse the pointer button mapping, e.g. in the case of
 	   "left-handed mouse mode"; the RDP session expects to
@@ -2382,12 +2620,12 @@ handle_button_event(XEvent xevent, RD_BOOL down)
 	if (xevent.xbutton.y < g_win_button_size)
 	{
 		/*  Check from right to left: */
-		if (xevent.xbutton.x >= g_width - g_win_button_size)
+		if (xevent.xbutton.x >= attr.width - g_win_button_size)
 		{
 			/* The close button, continue */
 			;
 		}
-		else if (xevent.xbutton.x >= g_width - g_win_button_size * 2)
+		else if (xevent.xbutton.x >= attr.width - g_win_button_size * 2)
 		{
 			/* The maximize/restore button. Do not send to
 			   server.  It might be a good idea to change the
@@ -2396,13 +2634,13 @@ handle_button_event(XEvent xevent, RD_BOOL down)
 			if (xevent.type == ButtonPress)
 				return;
 		}
-		else if (xevent.xbutton.x >= g_width - g_win_button_size * 3)
+		else if (xevent.xbutton.x >= attr.width - g_win_button_size * 3)
 		{
 			/* The minimize button. Iconify window. */
 			if (xevent.type == ButtonRelease)
 			{
 				/* Release the mouse button outside the minimize button, to prevent the
-				   actual minimazation to happen */
+				   actual minimization to happen */
 				rdp_send_input(time(NULL), input_type, button, 1, 1);
 				XIconifyWindow(g_display, g_wnd, DefaultScreen(g_display));
 				return;
@@ -2451,7 +2689,6 @@ handle_button_event(XEvent xevent, RD_BOOL down)
 	}
 }
 
-
 /* Process events in Xlib queue
    Returns 0 after user quit, 1 otherwise */
 static int
@@ -2464,6 +2701,7 @@ xwin_process_events(void)
 	Status status;
 	int events = 0;
 	seamless_window *sw;
+	static RD_BOOL is_g_wnd_mapped = False;
 
 	while ((XPending(g_display) > 0) && events++ < 20)
 	{
@@ -2495,7 +2733,7 @@ xwin_process_events(void)
 			case ClientMessage:
 				if (xevent.xclient.message_type == g_protocol_atom)
 				{
-					if (xevent.xclient.data.l[0] == (long)g_kill_atom)
+					if (xevent.xclient.data.l[0] == (long) g_kill_atom)
 					{
 						/* the window manager told us to quit */
 
@@ -2508,7 +2746,8 @@ xwin_process_events(void)
 						/* send seamless destroy process message */
 						seamless_send_destroy(sw->id);
 					}
-					else if (xevent.xclient.data.l[0] == (long)g_net_wm_ping_atom)
+					else if (xevent.xclient.data.l[0] ==
+						 (long) g_net_wm_ping_atom)
 					{
 						/* pass ping message further to root window */
 						xevent.xclient.window =
@@ -2757,28 +2996,111 @@ xwin_process_events(void)
 
 				break;
 			case MapNotify:
+				if (xevent.xconfigure.window == g_wnd)
+				{
+					XWindowAttributes attr;
+					XGetWindowAttributes(g_display, g_wnd, &attr);
+					g_window_width = attr.width;
+					g_window_height = attr.height;
+
+					logger(GUI, Debug,
+					       "xwin_process_events(), Window mapped with size %dx%d",
+					       g_window_width, g_window_height);
+
+					is_g_wnd_mapped = True;
+				}
+
 				if (!g_seamless_active)
-					rdp_send_client_window_status(1);
+				{
+					rdp_send_suppress_output_pdu(ALLOW_DISPLAY_UPDATES);
+				}
 				break;
 			case UnmapNotify:
+				if (xevent.xconfigure.window == g_wnd)
+				{
+					is_g_wnd_mapped = False;
+				}
+
 				if (!g_seamless_active)
-					rdp_send_client_window_status(0);
+				{
+					rdp_send_suppress_output_pdu(SUPPRESS_DISPLAY_UPDATES);
+				}
 				break;
 			case ConfigureNotify:
 #ifdef HAVE_XRANDR
-				if ((g_sizeopt || g_fullscreen)
-				    && xevent.xconfigure.window == DefaultRootWindow(g_display))
+				/* Resize on root window size change */
+				if (xevent.xconfigure.window == DefaultRootWindow(g_display))
 				{
-					if (xevent.xconfigure.width != WidthOfScreen(g_screen)
-					    || xevent.xconfigure.height != HeightOfScreen(g_screen))
+					/* only for fullscreen or x%-of-screen-sized windows */
+					if (g_window_size_type == PercentageOfScreen
+					    || g_window_size_type == Fullscreen || g_fullscreen)
 					{
-						XRRUpdateConfiguration(&xevent);
-						XSync(g_display, False);
-						g_pending_resize = True;
+						if (xevent.xconfigure.width !=
+						    WidthOfScreen(g_screen)
+						    || xevent.xconfigure.height !=
+						    HeightOfScreen(g_screen))
+						{
+
+							logger(GUI, Debug,
+							       "xwin_process_events(), ConfigureNotify: Root window changed to %dx%d",
+							       xevent.xconfigure.width,
+							       xevent.xconfigure.height);
+
+							gettimeofday(&g_resize_timer, NULL);
+
+							/* Resize fullscreen window to match root window size */
+							/* TODO: Handle percentage of screen */
+							if (g_fullscreen)
+								ui_resize_window(xevent.xconfigure.
+										 width,
+										 xevent.xconfigure.
+										 height);
+							g_pending_resize = True;
+						}
 					}
 
+					XRRUpdateConfiguration(&xevent);
+					XSync(g_display, False);
+
 				}
+				else
 #endif
+				if (xevent.xconfigure.window == g_wnd && !g_seamless_rdp
+					    && is_g_wnd_mapped)
+				{
+
+					/* Update window size */
+					g_window_width = xevent.xconfigure.width;
+					g_window_height = xevent.xconfigure.height;
+
+					uint32 w, h;
+					w = g_window_width;
+					h = g_window_height;
+
+					utils_apply_session_size_limitations(&w, &h);
+
+					logger(GUI, Debug,
+					       "xwin_process_events(), ConfigureNotify: session: %dx%d, new window: %dx%d (adj: %dx%d)",
+					       g_session_width, g_session_height, g_window_width,
+					       g_window_height, w, h);
+
+					if (g_session_width != w || g_session_height != h)
+					{
+						logger(GUI, Debug,
+						       "xwin_process_events(), ConfigureNotify: session: %dx%d, new window: %dx%d",
+						       g_session_width, g_session_height,
+						       g_window_width, g_window_height);
+
+						/* perform a resize */
+						gettimeofday(&g_resize_timer, NULL);
+						g_pending_resize = True;
+					}
+					else
+					{
+						g_pending_resize = False;
+					}
+				}
+
 				if (!g_seamless_active)
 					break;
 
@@ -2807,87 +3129,258 @@ xwin_process_events(void)
 	return 1;
 }
 
-/* Returns 0 after user quit or pending resize, 1 otherwise */
-int
-ui_select(int rdp_socket)
+static inline uint32
+time_difference_in_ms(struct timeval then, struct timeval now)
 {
-	int n;
+	uint32 ms;
+	ms = 0;
+	ms += (now.tv_sec - then.tv_sec) * 1000;
+	ms += (now.tv_usec - then.tv_usec) / 1000;
+	return ms;
+}
+
+time_t g_wait_for_deactivate_ts = 0;
+
+static RD_BOOL
+process_fds(int rdp_socket, int ms)
+{
 	int h_bkg;
+	int n, ret;
 	fd_set rfds, wfds;
 	struct timeval tv;
 	RD_BOOL s_timeout = False;
 
-	while (True)
+	if (g_dirty) BackgroundBackStoreStartup();
+
+	n = (rdp_socket > g_x_socket) ? rdp_socket : g_x_socket;
+
+	FD_ZERO(&rfds);
+	FD_ZERO(&wfds);
+	FD_SET(rdp_socket, &rfds);
+	FD_SET(g_x_socket, &rfds);
+
+	h_bkg = BackgroundBackStoreAddN(&n, &rfds);
+
+	/* default timeout */
+	tv.tv_sec = ms / 1000;
+	tv.tv_usec = (ms - (tv.tv_sec * 1000)) * 1000;
+
+#ifdef WITH_RDPSND
+	rdpsnd_add_fds(&n, &rfds, &wfds, &tv);
+#endif
+
+	/* add redirection handles */
+	rdpdr_add_fds(&n, &rfds, &wfds, &tv, &s_timeout);
+	seamless_select_timeout(&tv);
+
+	/* add ctrl slaves handles */
+	ctrl_add_fds(&n, &rfds);
+
+	n++;
+
+	ret = select(n, &rfds, &wfds, NULL, &tv);
+	if (ret <= 0)
 	{
-		if (g_dirty) BackgroundBackStoreStartup();
-
-		n = (rdp_socket > g_x_socket) ? rdp_socket : g_x_socket;
-		/* Process any events already waiting */
-		if (!xwin_process_events())
-			/* User quit */
-			return 0;
-
-		if (g_pending_resize)
-			return 0;
-
-		if (g_seamless_active)
-			sw_check_timers();
-
-		FD_ZERO(&rfds);
-		FD_ZERO(&wfds);
-		FD_SET(rdp_socket, &rfds);
-		FD_SET(g_x_socket, &rfds);
-
-		/* default timeout */
-		tv.tv_sec = 60;
-		tv.tv_usec = 0;
-
-#ifdef WITH_RDPSND
-		rdpsnd_add_fds(&n, &rfds, &wfds, &tv);
-#endif
-
-		/* add redirection handles */
-		rdpdr_add_fds(&n, &rfds, &wfds, &tv, &s_timeout);
-		seamless_select_timeout(&tv);
-
-		/* add ctrl slaves handles */
-		ctrl_add_fds(&n, &rfds);
-
-		h_bkg = BackgroundBackStoreAddN(&n, &rfds);
-
-		n++;
-
-		switch (select(n, &rfds, &wfds, NULL, &tv))
+		if (ret == -1)
 		{
-			case -1:
-				logger(GUI, Error, "ui_select(), select failed: %s",
-				       strerror(errno));
-
-			case 0:
-#ifdef WITH_RDPSND
-				rdpsnd_check_fds(&rfds, &wfds);
-#endif
-
-				/* Abort serial read calls */
-				if (s_timeout)
-					rdpdr_check_fds(&rfds, &wfds, (RD_BOOL) True);
-				continue;
+			logger(GUI, Error, "process_fds(), select failed: %s", strerror(errno));
 		}
-
 #ifdef WITH_RDPSND
 		rdpsnd_check_fds(&rfds, &wfds);
 #endif
 
-		rdpdr_check_fds(&rfds, &wfds, (RD_BOOL) False);
+		/* Abort serial read calls */
+		if (s_timeout)
+			rdpdr_check_fds(&rfds, &wfds, (RD_BOOL) True);
+		return False;
+	}
 
-		ctrl_check_fds(&rfds, &wfds);
+	if (h_bkg >= 0 && FD_ISSET(h_bkg, &rfds))
+		BackgroundBackStoreShutdown();
 
-		if (h_bkg >= 0 && FD_ISSET(h_bkg, &rfds))
-			BackgroundBackStoreShutdown();
+#ifdef WITH_RDPSND
+	rdpsnd_check_fds(&rfds, &wfds);
+#endif
 
-		if (FD_ISSET(rdp_socket, &rfds))
-			return 1;
+	rdpdr_check_fds(&rfds, &wfds, (RD_BOOL) False);
 
+	ctrl_check_fds(&rfds, &wfds);
+
+	if (FD_ISSET(rdp_socket, &rfds))
+		return True;
+
+	return False;
+}
+
+static RD_BOOL
+timeval_is_set(struct timeval *time)
+{
+	return (time->tv_sec == 0 && time->tv_usec == 0) ? False : True;
+}
+
+/* Handle a pending resize. Resize is handled by either a disconnect/reconnect
+   sequence or online using RDPEDISP messages. Windows 2008 requires the use of
+   disconnect/reconnect and to do that without user login credentials the
+   auto-reconnect cookie is used. Windows 2008 seems sensitive to disconnects
+   to early in the login sequence so we defer to resize until we get the cookie.
+
+   Windows 2016 on the other hand does not seem to send cookies but uses
+   RDPEDISP so in this case we defer until the RDPEDISP channel is established.
+ */
+static RD_BOOL
+process_pending_resize()
+{
+	time_t now_ts;
+	struct timeval now;
+
+	/* Rate limit ConfigureNotify events before performing a
+	   resize - enough time has to pass after the last event
+	 */
+	gettimeofday(&now, NULL);
+	if (time_difference_in_ms(g_resize_timer, now) <= 500)
+		return False;
+
+	/* There is a race problem when using disconnect / reconnect
+	   sequence were one sometimes would be presented with
+	   unexpected login window. Waiting a little bit extra after
+	   getting the reconnect cookie solves this problem.
+
+	   In addition to that delay, we also want to wait for
+	   RDPEDISP to become available. In scenarios where we can use
+	   both online and reconnect-based resizes, we prefer
+	   online. Our brief investigation shows that RDPEDISP support
+	   is established about 100-300 ms after the login info packet
+	   was received. Thus, we want to wait a bit so we can avoid
+	   resizes using reconnect. Once RDPEDISP is established, the
+	   defer timer is cleared, so there will be no delay before
+	   the first resize for servers that support RDPEDISP. Other
+	   servers will get the initial resize delayed with 2 seconds.
+	 */
+
+	if (timeval_is_set(&g_pending_resize_defer_timer) &&
+	    time_difference_in_ms(g_pending_resize_defer_timer, now) >= 2000)
+	{
+		g_pending_resize_defer_timer.tv_sec = g_pending_resize_defer_timer.tv_usec = 0;
+		g_pending_resize_defer = False;
+	}
+
+	if (g_pending_resize_defer == True)
+		return False;
+
+	/* Set up width and height for new session */
+	if (g_fullscreen || g_seamless_rdp)
+	{
+		/* follow root window size */
+		g_requested_session_width = WidthOfScreen(g_screen);
+		g_requested_session_height = HeightOfScreen(g_screen);
+		if (g_window_size_type == PercentageOfScreen)
+		{
+			/* TODO: Implement percentage of screen */
+		}
+	}
+	else
+	{
+		/* Follow window size */
+		g_requested_session_width = g_window_width;
+		g_requested_session_height = g_window_height;
+	}
+
+
+	/* Carry out a resize to desired size */
+	if (rdpedisp_is_available() == False)
+	{
+		/* resize session using disconnect reconnect
+		 * sequence when RDPEDISP is not supported by
+		 * server by returning to outer loop.
+		 */
+
+		logger(GUI, Verbose, "Window resize detected, reconnecting to new size %dx%d",
+		       g_requested_session_width, g_requested_session_height);
+
+		return True;
+	}
+	else
+	{
+		now_ts = time(NULL);
+		if (now_ts - g_wait_for_deactivate_ts <= 5)
+			return False;
+
+		logger(GUI, Verbose,
+		       "Window resize detected, requesting matching session size %dx%d",
+		       g_requested_session_width, g_requested_session_height);
+
+		rdpedisp_set_session_size(g_requested_session_width, g_requested_session_height);
+
+		g_pending_resize = False;
+		g_wait_for_deactivate_ts = now_ts;
+	}
+
+	return False;
+}
+
+/* This function is the heart of the mainloop pump in
+   rdekstop. Handles processing of pending X11 events and data on all
+   file descriptors used by rdesktop except for rdp_socket.
+   Processing of data on rdp_socket is done by returning from this
+   function to the calling tcp_recv().
+
+   This function will return if there is data available for reading on
+   rdp_socket or if g_exit_mainloop flag is set.
+*/
+void
+ui_select(int rdp_socket)
+{
+	int timeout;
+	RD_BOOL rdp_socket_has_data = False;
+
+	while (g_exit_mainloop == False && rdp_socket_has_data == False)
+	{
+		/* Process a limited amount of pending x11 events */
+		if (!xwin_process_events())
+		{
+			/* User quit */
+			g_user_quit = True;
+			g_exit_mainloop = True;
+			g_pending_resize = False;
+			continue;
+		}
+
+		if (g_pending_resize == True && g_dynamic_session_resize)
+		{
+			/* returns True on disconnect-reconnect resize */
+			if (process_pending_resize() == True)
+			{
+				g_exit_mainloop = True;
+				continue;
+			}
+		}
+
+		if (g_seamless_active)
+			sw_check_timers();
+
+		/* process_fds() is a little special, it does two
+		   things in one. It will perform a select() on all
+		   filedescriptors; rdpsnd / rdpdr / ctrl and
+		   rdp_socket passed as argument. If data is available
+		   on any filedescriptor except rdp_socket, it will be processed.
+
+		   If data is available on rdp_socket, the call return
+		   true and we exit from ui_select() to let tcp_recv()
+		   read data from rdp_socket.
+
+		   Use 60 seconds as default timeout for select. If
+		   there is more X11 events on queue or g_pend is set,
+		   use a low timeout.
+		 */
+
+		timeout = 60000;
+
+		if (XPending(g_display) > 0)
+			timeout = 0;
+		else if (g_pending_resize == True)
+			timeout = 100;
+
+		rdp_socket_has_data = process_fds(rdp_socket, timeout);
 	}
 }
 
@@ -3023,6 +3516,7 @@ get_pixel(uint32 idx, uint8 * andmask, uint8 * xormask, int bpp, uint8 * xor_fla
 	uint32 argb;
 	uint8 alpha;
 	uint8 *pxor;
+	PixelColour pc;
 
 	*xor_flag = 0;
 
@@ -3038,13 +3532,21 @@ get_pixel(uint32 idx, uint8 * andmask, uint8 * xormask, int bpp, uint8 * xor_fla
 			{
 				// If we have an xor bit is high and
 				// andmask bit is low, we should
-				// render a black pixle due to we can
+				// render a black pixel due to we can
 				// not xor blit in X11.
 				argb = 0xff000000;
 				*xor_flag = 1;
 			}
 			else
 				argb = (alpha << 24) | (argb ? 0xffffff : 0x000000);
+			break;
+
+		case 16:
+			offs = idx * 2;
+			pxor = xormask + offs;
+			SPLITCOLOUR16(*((uint16 *) pxor), pc);
+			alpha = GET_BIT(andmask, idx) ? 0x00 : 0xff;
+			argb = (alpha << 24) | (pc.red << 16) | (pc.green << 8) | pc.blue;
 			break;
 
 		case 24:
@@ -3064,7 +3566,7 @@ get_pixel(uint32 idx, uint8 * andmask, uint8 * xormask, int bpp, uint8 * xor_fla
 	return argb;
 }
 
-/* Copies the pixles from src to dest with given color and offset */
+/* Copies the pixels from src to dest with given color and offset */
 static inline void
 xcursor_stencil(XcursorImage * src, XcursorImage * dst, int dx, int dy, uint32 argb)
 {
@@ -3072,17 +3574,17 @@ xcursor_stencil(XcursorImage * src, XcursorImage * dst, int dx, int dy, uint32 a
 	assert(src->width == dst->width);
 	assert(src->height == dst->height);
 
-	for (y = 0; y < src->height; y++)
+	for (y = 0; y < (int) src->height; y++)
 	{
-		for (x = 0; x < src->width; x++)
+		for (x = 0; x < (int) src->width; x++)
 		{
 			si = y * src->width + x;
 			if (!src->pixels[si])
 				continue;
 
-			if ((y + dy) < 0 || (y + dy) >= dst->height)
+			if ((y + dy) < 0 || (y + dy) >= (int) dst->height)
 				continue;
-			if ((x + dx) < 0 || (x + dx) >= dst->width)
+			if ((x + dx) < 0 || (x + dx) >= (int) dst->width)
 				continue;
 			di = (y + dy) * src->width + (x + dx);
 			dst->pixels[di] = argb;
@@ -3105,8 +3607,8 @@ xcursor_merge(XcursorImage * src, XcursorImage * dst)
 }
 
 RD_HCURSOR
-ui_create_cursor(unsigned int xhot, unsigned int yhot, int width,
-		 int height, uint8 * andmask, uint8 * xormask, int bpp)
+ui_create_cursor(unsigned int xhot, unsigned int yhot, uint32 width,
+		 uint32 height, uint8 * andmask, uint8 * xormask, int bpp)
 {
 	Cursor cursor;
 	XcursorPixel *out;
@@ -3117,7 +3619,7 @@ ui_create_cursor(unsigned int xhot, unsigned int yhot, int width,
 	logger(GUI, Debug, "ui_create_cursor(): xhot=%d, yhot=%d, width=%d, height=%d, bpp=%d",
 	       xhot, yhot, width, height, bpp);
 
-	if (bpp != 1 && bpp != 24 && bpp != 32)
+	if (bpp != 1 && bpp != 16 && bpp != 24 && bpp != 32)
 	{
 		logger(GUI, Warning, "ui_create_xcursor_cursor(): Unhandled cursor bit depth %d",
 		       bpp);
@@ -3188,7 +3690,8 @@ void
 ui_set_cursor(RD_HCURSOR cursor)
 {
 	extern RD_BOOL g_local_cursor;
-	if (g_local_cursor) return ;
+	if (g_local_cursor)
+		return;
 	logger(GUI, Debug, "ui_set_cursor(): g_current_cursor = %p, new = %p",
 	       g_current_cursor, cursor);
 
@@ -3200,6 +3703,10 @@ ui_set_cursor(RD_HCURSOR cursor)
 void
 ui_destroy_cursor(RD_HCURSOR cursor)
 {
+	// Do not destroy fallback null cursor
+	if (cursor == g_null_cursor)
+		return;
+
 	XFreeCursor(g_display, (Cursor) cursor);
 }
 
@@ -3361,11 +3868,9 @@ ui_set_clip(int x, int y, int cx, int cy)
 void
 ui_reset_clip(void)
 {
-	g_clip_rectangle.x = 0;
-	g_clip_rectangle.y = 0;
-	g_clip_rectangle.width = g_width;
-	g_clip_rectangle.height = g_height;
-	XSetClipRectangles(g_display, g_gc, 0, 0, &g_clip_rectangle, 1, YXBanded);
+	XWindowAttributes attr;
+	XGetWindowAttributes(g_display, g_wnd, &attr);
+	ui_set_clip(0, 0, attr.width, attr.height);
 }
 
 void
@@ -3395,7 +3900,7 @@ static uint8 hatch_patterns[] = {
 void
 ui_patblt(uint8 opcode,
 	  /* dest */ int x, int y, int cx, int cy,
-	  /* brush */ BRUSH * brush, int bgcolour, int fgcolour)
+	  /* brush */ BRUSH * brush, uint32 bgcolour, uint32 fgcolour)
 {
 	Pixmap fill;
 	uint8 i, ipattern[8];
@@ -3533,7 +4038,7 @@ void
 ui_triblt(uint8 opcode,
 	  /* dest */ int x, int y, int cx, int cy,
 	  /* src */ RD_HBITMAP src, int srcx, int srcy,
-	  /* brush */ BRUSH * brush, int bgcolour, int fgcolour)
+	  /* brush */ BRUSH * brush, uint32 bgcolour, uint32 fgcolour)
 {
 	/* This is potentially difficult to do in general. Until someone
 	   comes up with a more efficient way of doing it I am using cases. */
@@ -3584,7 +4089,7 @@ ui_line(uint8 opcode,
 void
 ui_rect(
 	       /* dest */ int x, int y, int cx, int cy,
-	       /* brush */ int colour)
+	       /* brush */ uint32 colour)
 {
 	SET_FOREGROUND(colour);
 	FILL_RECTANGLE(x, y, cx, cy);
@@ -3594,7 +4099,7 @@ void
 ui_polygon(uint8 opcode,
 	   /* mode */ uint8 fillmode,
 	   /* dest */ RD_POINT * point, int npoints,
-	   /* brush */ BRUSH * brush, int bgcolour, int fgcolour)
+	   /* brush */ BRUSH * brush, uint32 bgcolour, uint32 fgcolour)
 {
 	uint8 style, i, ipattern[8];
 	Pixmap fill;
@@ -3713,7 +4218,7 @@ void
 ui_ellipse(uint8 opcode,
 	   /* mode */ uint8 fillmode,
 	   /* dest */ int x, int y, int cx, int cy,
-	   /* brush */ BRUSH * brush, int bgcolour, int fgcolour)
+	   /* brush */ BRUSH * brush, uint32 bgcolour, uint32 fgcolour)
 {
 	uint8 style, i, ipattern[8];
 	Pixmap fill;
@@ -3789,7 +4294,7 @@ ui_ellipse(uint8 opcode,
 			break;
 
 		default:
-			logger(GUI, Warning, "Unimplemented brush styke %d", brush->style);
+			logger(GUI, Warning, "Unimplemented brush style %d", brush->style);
 	}
 
 	RESET_FUNCTION(opcode);
@@ -3800,7 +4305,7 @@ void
 ui_draw_glyph(int mixmode,
 	      /* dest */ int x, int y, int cx, int cy,
 	      /* src */ RD_HGLYPH glyph, int srcx, int srcy,
-	      int bgcolour, int fgcolour)
+	      uint32 bgcolour, uint32 fgcolour)
 {
 	UNUSED(srcx);
 	UNUSED(srcy);
@@ -3857,10 +4362,13 @@ void
 ui_draw_text(uint8 font, uint8 flags, uint8 opcode, int mixmode, int x, int y,
 	     int clipx, int clipy, int clipcx, int clipcy,
 	     int boxx, int boxy, int boxcx, int boxcy, BRUSH * brush,
-	     int bgcolour, int fgcolour, uint8 * text, uint8 length)
+	     uint32 bgcolour, uint32 fgcolour, uint8 * text, uint8 length)
 {
+	XWindowAttributes attr;
 	UNUSED(opcode);
 	UNUSED(brush);
+
+	XGetWindowAttributes(g_display, g_wnd, &attr);
 
 	/* TODO: use brush appropriately */
 
@@ -3873,8 +4381,8 @@ ui_draw_text(uint8 font, uint8 flags, uint8 opcode, int mixmode, int x, int y,
 	/* Sometimes, the boxcx value is something really large, like
 	   32691. This makes XCopyArea fail with Xvnc. The code below
 	   is a quick fix. */
-	if (boxx + boxcx > g_width)
-		boxcx = g_width - boxx;
+	if (boxx + boxcx > attr.width)
+		boxcx = attr.width - boxx;
 
 	if (boxcx > 1)
 	{
@@ -4168,6 +4676,7 @@ ui_seamless_create_window(unsigned long id, unsigned long group, unsigned long p
 	XSizeHints *sizehints;
 	XWMHints *wmhints;
 	long input_mask;
+	unsigned long value_mask;
 	seamless_window *sw, *sw_parent;
 
 	if (!g_seamless_active)
@@ -4178,10 +4687,10 @@ ui_seamless_create_window(unsigned long id, unsigned long group, unsigned long p
 	if (sw)
 		return;
 
-	get_window_attribs(&attribs);
+	value_mask = get_window_attribs_seamless(&attribs);
 	wnd = XCreateWindow(g_display, RootWindowOfScreen(g_screen), -1, -1, 1, 1, 0, g_depth,
-			    InputOutput, g_visual,
-			    CWBackPixel | CWBackingStore | CWColormap | CWBorderPixel, &attribs);
+			    InputOutput, g_visual, value_mask, &attribs);
+
 	ewmh_set_wm_pid(wnd, getpid());
 	set_wm_client_machine(g_display, wnd);
 
@@ -4212,7 +4721,7 @@ ui_seamless_create_window(unsigned long id, unsigned long group, unsigned long p
 	if (parent == 0xFFFFFFFF)
 	{
 		XSetTransientForHint(g_display, wnd, RootWindowOfScreen(g_screen));
-		/* Some buggy wm:s (kwin) do not handle the above, so fake it
+		/* Some buggy WMs (kwin) do not handle the above, so fake it
 		   using some other hints. */
 		ewmh_set_window_popup(wnd);
 	}
@@ -4223,13 +4732,13 @@ ui_seamless_create_window(unsigned long id, unsigned long group, unsigned long p
 		if (sw_parent)
 			XSetTransientForHint(g_display, wnd, sw_parent->wnd);
 		else
-			logger(GUI, Warning, "ui_seamles_create_window(): no parent window 0x%lx\n",
-			       parent);
+			logger(GUI, Warning,
+			       "ui_seamless_create_window(): no parent window 0x%lx\n", parent);
 	}
 
 	if (flags & SEAMLESSRDP_CREATE_MODAL)
 	{
-		/* We do this to support buggy wm:s (*cough* metacity *cough*)
+		/* We do this to support buggy WMs (*cough* Metacity *cough*)
 		   somewhat at least */
 		if (parent == 0x00000000)
 			XSetTransientForHint(g_display, wnd, RootWindowOfScreen(g_screen));
@@ -4338,7 +4847,7 @@ ui_seamless_destroy_group(unsigned long id, unsigned long flags)
 
 void
 ui_seamless_seticon(unsigned long id, const char *format, int width, int height, int chunk,
-		    const char *data, int chunk_len)
+		    const char *data, size_t chunk_len)
 {
 	seamless_window *sw;
 
@@ -4728,7 +5237,7 @@ BackgroundBackStoreStartup()
 	if (g_backstore2_shm)
 		XShmGetImage(g_display, g_backstore, g_backstore2, 0, 0, AllPlanes);
 	else
-		g_backstore2 = XGetImage(g_display, g_backstore, 0, 0, g_width, g_height, AllPlanes, ZPixmap);
+		g_backstore2 = XGetImage(g_display, g_backstore, 0, 0, g_requested_session_width, g_requested_session_height, AllPlanes, ZPixmap);
 	write(g_bkwh[1], &g_running, 1);
 	g_dirty = 0;
 	g_running = 1;
@@ -4745,11 +5254,11 @@ BackgroundBackStoreShutdown()
 	g_running = 0;
 	if (g_backstore2_shm) {
 		XFlush(g_display);
-		XShmPutImage(g_display, g_wnd, g_gc, g_backstore2, 0, 0, 0, 0, g_width, g_height, 1);
-		XShmPutImage(g_display, g_backstore3, g_gc, g_backstore2, 0, 0, 0, 0, g_width, g_height, 1);
+		XShmPutImage(g_display, g_wnd, g_gc, g_backstore2, 0, 0, 0, 0, g_requested_session_width, g_requested_session_height, 1);
+		XShmPutImage(g_display, g_backstore3, g_gc, g_backstore2, 0, 0, 0, 0, g_requested_session_width, g_requested_session_height, 1);
 	} else {
-		XPutImage(g_display, g_wnd, g_gc, g_backstore2, 0, 0, 0, 0, g_width, g_height);
-		XPutImage(g_display, g_backstore3, g_gc, g_backstore2, 0, 0, 0, 0, g_width, g_height);
+		XPutImage(g_display, g_wnd, g_gc, g_backstore2, 0, 0, 0, 0, g_requested_session_width, g_requested_session_height);
+		XPutImage(g_display, g_backstore3, g_gc, g_backstore2, 0, 0, 0, 0, g_requested_session_width, g_requested_session_height);
 		XFree(g_backstore2);
 		g_backstore2 = NULL;
 	}
