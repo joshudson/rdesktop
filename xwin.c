@@ -242,6 +242,7 @@ static int g_running = 0;
 
 static void BackgroundBackStoreStartup();
 static void BackgroundBackStoreShutdown();
+static void BackgroundBackStoreJoin();
 static int BackgroundBackStoreAddN(int *n, fd_set *rdfs);
 
 static int
@@ -2305,7 +2306,11 @@ ui_create_window(uint32 width, uint32 height)
 				if (XShmAttach(g_display, &g_backstore2_shminfo)) {
 					g_backstore2_shm = 1;
 				} else {
-					logger(GUI, Warning, "XShmAttached failed.");
+					logger(GUI, Warning, "XShmAttached failed; lag will be terrible.");
+					if (g_backstore2_shminfo.shmaddr != (void*)-1) {
+						shmdt(g_backstore2_shminfo.shmaddr);
+						g_backstore2_shminfo.shmid = 0;
+					}
 				}
 			} else
 				logger(GUI, Warning, "XShm not supported; lag will be terrible.");
@@ -2466,14 +2471,16 @@ ui_destroy_window(void)
 	{
 		if (!g_direct)
 		{
-			/* TODO: Gather thread */
+			BackgroundBackStoreJoin();
 			if (g_backstore2 != 0)
 			{
+				if (g_backstore2_shm)
+					XShmDetach(g_display, &g_backstore2_shminfo);
 				XDestroyImage(g_backstore2);
 				g_backstore2 = 0;
 			}
 			XFreePixmap(g_display, g_backstore3);
-			g_backstore = 0;
+			g_backstore3 = 0;
 		}
 		XFreePixmap(g_display, g_backstore);
 		g_backstore = 0;
@@ -3148,68 +3155,72 @@ process_fds(int rdp_socket, int ms)
 	int n, ret;
 	fd_set rfds, wfds;
 	struct timeval tv;
-	RD_BOOL s_timeout = False;
+	RD_BOOL s_timeout;
 
-	if (g_dirty) BackgroundBackStoreStartup();
+	while(1)
+	{
+		if (g_dirty) BackgroundBackStoreStartup();
+		s_timeout = True;
 
-	n = (rdp_socket > g_x_socket) ? rdp_socket : g_x_socket;
+		n = (rdp_socket > g_x_socket) ? rdp_socket : g_x_socket;
 
-	FD_ZERO(&rfds);
-	FD_ZERO(&wfds);
-	FD_SET(rdp_socket, &rfds);
-	FD_SET(g_x_socket, &rfds);
+		FD_ZERO(&rfds);
+		FD_ZERO(&wfds);
+		FD_SET(rdp_socket, &rfds);
+		FD_SET(g_x_socket, &rfds);
 
-	h_bkg = BackgroundBackStoreAddN(&n, &rfds);
+		h_bkg = BackgroundBackStoreAddN(&n, &rfds);
 
-	/* default timeout */
-	tv.tv_sec = ms / 1000;
-	tv.tv_usec = (ms - (tv.tv_sec * 1000)) * 1000;
+		/* default timeout */
+		tv.tv_sec = ms / 1000;
+		tv.tv_usec = (ms - (tv.tv_sec * 1000)) * 1000;
 
 #ifdef WITH_RDPSND
-	rdpsnd_add_fds(&n, &rfds, &wfds, &tv);
+		rdpsnd_add_fds(&n, &rfds, &wfds, &tv);
 #endif
 
-	/* add redirection handles */
-	rdpdr_add_fds(&n, &rfds, &wfds, &tv, &s_timeout);
-	seamless_select_timeout(&tv);
+		/* add redirection handles */
+		rdpdr_add_fds(&n, &rfds, &wfds, &tv, &s_timeout);
+		seamless_select_timeout(&tv);
 
-	/* add ctrl slaves handles */
-	ctrl_add_fds(&n, &rfds);
+		/* add ctrl slaves handles */
+		ctrl_add_fds(&n, &rfds);
 
-	n++;
+		n++;
 
-	ret = select(n, &rfds, &wfds, NULL, &tv);
-	if (ret <= 0)
-	{
-		if (ret == -1)
+		ret = select(n, &rfds, &wfds, NULL, &tv);
+		if (ret <= 0)
 		{
-			logger(GUI, Error, "process_fds(), select failed: %s", strerror(errno));
+			if (ret == -1)
+			{
+				logger(GUI, Error, "process_fds(), select failed: %s", strerror(errno));
+			}
+#ifdef WITH_RDPSND
+			rdpsnd_check_fds(&rfds, &wfds);
+#endif
+
+			/* Abort serial read calls */
+			if (s_timeout)
+				rdpdr_check_fds(&rfds, &wfds, (RD_BOOL) True);
+			return False;
 		}
+
+		if (h_bkg >= 0 && FD_ISSET(h_bkg, &rfds))
+			BackgroundBackStoreShutdown();
+
 #ifdef WITH_RDPSND
 		rdpsnd_check_fds(&rfds, &wfds);
 #endif
 
-		/* Abort serial read calls */
-		if (s_timeout)
-			rdpdr_check_fds(&rfds, &wfds, (RD_BOOL) True);
-		return False;
+		rdpdr_check_fds(&rfds, &wfds, (RD_BOOL) False);
+
+		ctrl_check_fds(&rfds, &wfds);
+
+		if (FD_ISSET(rdp_socket, &rfds))
+			return True;
+		if (FD_ISSET(g_x_socket, &rfds))
+			return False;
 	}
-
-	if (h_bkg >= 0 && FD_ISSET(h_bkg, &rfds))
-		BackgroundBackStoreShutdown();
-
-#ifdef WITH_RDPSND
-	rdpsnd_check_fds(&rfds, &wfds);
-#endif
-
-	rdpdr_check_fds(&rfds, &wfds, (RD_BOOL) False);
-
-	ctrl_check_fds(&rfds, &wfds);
-
-	if (FD_ISSET(rdp_socket, &rfds))
-		return True;
-
-	return False;
 }
 
 static RD_BOOL
@@ -5190,15 +5201,17 @@ static struct timeval measure_start;
 static struct timeval measure_stop;
 #endif
 
-static void *BackgroundWorker(void *ignored)
+static void *
+BackgroundWorker(void *ignored)
 {
-	ignored = NULL;
-	for(;;) {
-		read(g_bkwh[0], &ignored, 1);
+	char shutdown_command;
+	for(;read(g_bkwh[0], &shutdown_command, 1), !shutdown_command;)
+	{
 		SurgeAdjustImage(g_backstore2);
-		write(g_bkrh[1], &ignored, 1);
+		write(g_bkrh[1], &shutdown_command, 1);
 	}
-	return NULL; /* unreachable -- shut up warning */
+	write(g_bkrh[1], &shutdown_command, 1);
+	return NULL;
 }
 
 static int
@@ -5211,12 +5224,13 @@ BackgroundBackStoreAddN(int *n, fd_set *rdfs)
 	return g_bkrh[0];
 }
 
+static pthread_t g_backgroundworker;
+
 static void
 BackgroundBackStoreStartup()
 {
 	if (!g_dirty || g_running) return ;
 	if (g_bkrh[0] < 0) {
-		pthread_t useless;
 		if (pipe(g_bkrh)) {
 			logger(Core, Error, "Unable to create internal pipe");
 			exit(3);
@@ -5225,7 +5239,7 @@ BackgroundBackStoreStartup()
 			logger(Core, Error, "Unable to create internal pipe (2)");
 			exit(3);
 		}
-		if (pthread_create(&useless, NULL, BackgroundWorker, NULL)) {
+		if (pthread_create(&g_backgroundworker, NULL, BackgroundWorker, NULL)) {
 			logger(Core, Error, "Unable to create background worker thread");
 			exit(3);
 		}
@@ -5238,9 +5252,32 @@ BackgroundBackStoreStartup()
 		XShmGetImage(g_display, g_backstore, g_backstore2, 0, 0, AllPlanes);
 	else
 		g_backstore2 = XGetImage(g_display, g_backstore, 0, 0, g_requested_session_width, g_requested_session_height, AllPlanes, ZPixmap);
-	write(g_bkwh[1], &g_running, 1);
+	write(g_bkwh[1], &g_running, 1); /* always writes a 0 byte */
 	g_dirty = 0;
 	g_running = 1;
+}
+
+static void
+BackgroundBackStoreRendezvous()
+{
+	char ignored;
+	read(g_bkrh[0], &ignored, 1);
+	g_running = 0;
+}
+
+static void
+BackgroundBackStoreJoin()
+{
+	if (g_bkrh[0] < 0) return;
+	void *ignored;
+	char stop = 1;
+	write(g_bkwh[1], &stop, 1);
+	BackgroundBackStoreRendezvous();
+	close(g_bkrh[0]); g_bkrh[0] = -1; /* these either contain an open handle or -1 */
+	close(g_bkrh[1]); g_bkrh[1] = -1;
+	close(g_bkwh[0]); g_bkwh[0] = -1;
+	close(g_bkwh[1]); g_bkwh[1] = -1;
+	pthread_join(g_backgroundworker, &ignored);
 }
 
 static void
@@ -5249,9 +5286,7 @@ BackgroundBackStoreShutdown()
 #ifdef PROFILE_SURGE
 	struct timeval tv_diff;
 #endif
-	char ignored;
-	read(g_bkrh[0], &ignored, 1);
-	g_running = 0;
+	BackgroundBackStoreRendezvous();
 	if (g_backstore2_shm) {
 		XFlush(g_display);
 		XShmPutImage(g_display, g_wnd, g_gc, g_backstore2, 0, 0, 0, 0, g_requested_session_width, g_requested_session_height, 1);
