@@ -203,6 +203,8 @@ extern int g_surge;
 static Pixmap g_backstore = 0;
 static XImage *g_backstore2 = 0;
 static XShmSegmentInfo g_backstore2_shminfo;
+static RD_BOOL g_triedshm = 0;
+static RD_BOOL g_haveshm = 0;
 static RD_BOOL g_backstore2_shm = 0;
 static Pixmap g_backstore3 = 0;
 
@@ -236,6 +238,9 @@ typedef struct
 	uint32 blue;
 }
 PixelColour;
+
+static void ui_init_backstore3(uint32 width, uint32 height);
+static void ui_teardown_backstore3();
 
 static int g_dirty = 0;
 static int g_running = 0;
@@ -2275,45 +2280,7 @@ ui_create_window(uint32 width, uint32 height)
 
 		if (g_surge >= 0)
 		{
-			int localdepth = 24;
-			g_backstore3 = XCreatePixmap(g_display, g_wnd, width, height, g_depth);
-			XFillRectangle(g_display, g_backstore3, g_gc, 0, 0, width, height);
-
-			/* This way of detecting depth works, but can return 32 when 24 must be used. */
-			g_backstore2 = XGetImage(g_display, RootWindow(g_display, 0), 0, 0, 4, 4,
-					AllPlanes, ZPixmap);
-			if (g_backstore2 != NULL) {
-				localdepth = g_backstore2->bitmap_pad;
-				XFree(g_backstore2);
-			}
-
-			g_backstore2_shm = 0;
-			g_backstore2 = NULL;
-			XFlush(g_display);
-			if (XShmQueryExtension(g_display))
-				g_backstore2 = XShmCreateImage(g_display, g_visual, localdepth > 24 ? 24 : localdepth,
-					ZPixmap, NULL, &g_backstore2_shminfo, width, height);
-			if (g_backstore2 != NULL) {
-				g_backstore2_shminfo.shmid = shmget(IPC_PRIVATE,
-					g_backstore2->bytes_per_line * g_backstore2->height, IPC_CREAT|0777);
-				if (g_backstore2_shminfo.shmid == -1)
-					logger(GUI, Error, "shmget failed.");
-				g_backstore2_shminfo.shmaddr =
-					g_backstore2->data = shmat(g_backstore2_shminfo.shmid, 0, 0);
-				if (g_backstore2_shminfo.shmaddr == (void*)-1)
-					logger(GUI, Error, "shmat failed.");
-				g_backstore2_shminfo.readOnly = 0;
-				if (XShmAttach(g_display, &g_backstore2_shminfo)) {
-					g_backstore2_shm = 1;
-				} else {
-					logger(GUI, Warning, "XShmAttached failed; lag will be terrible.");
-					if (g_backstore2_shminfo.shmaddr != (void*)-1) {
-						shmdt(g_backstore2_shminfo.shmaddr);
-						g_backstore2_shminfo.shmid = 0;
-					}
-				}
-			} else
-				logger(GUI, Warning, "XShm not supported; lag will be terrible.");
+			ui_init_backstore3(width, height);
 		}
 	}
 
@@ -2401,6 +2368,65 @@ ui_create_window(uint32 width, uint32 height)
 	return True;
 }
 
+static void
+ui_init_backstore3(uint32 width, uint32 height)
+{
+	int localdepth = 24;
+	g_backstore3 = XCreatePixmap(g_display, g_wnd, width, height, g_depth);
+	XFillRectangle(g_display, g_backstore3, g_gc, 0, 0, width, height);
+
+	/* This way of detecting depth works, but can return 32 when 24 must be used. */
+	g_backstore2 = XGetImage(g_display, RootWindow(g_display, 0), 0, 0, 4, 4,
+			AllPlanes, ZPixmap);
+	if (g_backstore2 != NULL) {
+		localdepth = g_backstore2->bitmap_pad;
+		XFree(g_backstore2);
+	}
+
+	g_backstore2_shm = 0;
+	g_backstore2 = NULL;
+	XFlush(g_display);
+	if ((g_haveshm || !g_triedshm) && XShmQueryExtension(g_display))
+		g_backstore2 = XShmCreateImage(g_display, g_visual, localdepth > 24 ? 24 : localdepth,
+			ZPixmap, NULL, &g_backstore2_shminfo, width, height);
+	if (g_backstore2 != NULL) {
+		g_backstore2_shminfo.shmid = shmget(IPC_PRIVATE,
+			g_backstore2->bytes_per_line * g_backstore2->height, IPC_CREAT|0777);
+		if (g_backstore2_shminfo.shmid == -1)
+		{
+			if (!g_triedshm)
+				logger(GUI, Error, "shmget failed.");
+			goto shm_failed;
+		}
+		g_backstore2_shminfo.shmaddr =
+			g_backstore2->data = shmat(g_backstore2_shminfo.shmid, 0, 0);
+		if (g_backstore2_shminfo.shmaddr == (void*)-1)
+		{
+			if (!g_triedshm)
+				logger(GUI, Error, "shmat failed.");
+			goto shm_failed;
+		}
+		g_backstore2_shminfo.readOnly = 0;
+		if (XShmAttach(g_display, &g_backstore2_shminfo))
+		{
+			g_backstore2_shm = 1;
+			g_haveshm = 1;
+		} else {
+			if (!g_triedshm)
+				logger(GUI, Warning, "XShmAttached failed; lag will be terrible.");
+			if (g_backstore2_shminfo.shmaddr != (void*)-1) {
+				shmdt(g_backstore2_shminfo.shmaddr);
+				g_backstore2_shminfo.shmid = 0;
+			}
+		}
+	} else {
+shm_failed:
+		if (!g_triedshm)
+			logger(GUI, Warning, "XShm not supported; lag will be terrible.");
+	}
+	g_triedshm = 1;
+}
+
 void
 ui_resize_window(uint32 width, uint32 height)
 {
@@ -2438,8 +2464,8 @@ ui_resize_window(uint32 width, uint32 height)
 	{
 		if (!g_direct)
 		{
-			/* TODO FIXME */
-			exit(3);
+			ui_teardown_backstore3();
+			ui_init_backstore3(width, height);
 		}
 		bs = XCreatePixmap(g_display, g_wnd, width, height, g_depth);
 		XSetForeground(g_display, g_gc, BlackPixelOfScreen(g_screen));
@@ -2471,20 +2497,26 @@ ui_destroy_window(void)
 	{
 		if (!g_direct)
 		{
-			BackgroundBackStoreJoin();
-			if (g_backstore2 != 0)
-			{
-				if (g_backstore2_shm)
-					XShmDetach(g_display, &g_backstore2_shminfo);
-				XDestroyImage(g_backstore2);
-				g_backstore2 = 0;
-			}
-			XFreePixmap(g_display, g_backstore3);
-			g_backstore3 = 0;
+			ui_teardown_backstore3();
 		}
 		XFreePixmap(g_display, g_backstore);
 		g_backstore = 0;
 	}
+}
+
+static void
+ui_teardown_backstore3()
+{
+	BackgroundBackStoreJoin();
+	if (g_backstore2 != 0)
+	{
+		if (g_backstore2_shm)
+			XShmDetach(g_display, &g_backstore2_shminfo);
+		XDestroyImage(g_backstore2);
+		g_backstore2 = 0;
+	}
+	XFreePixmap(g_display, g_backstore3);
+	g_backstore3 = 0;
 }
 
 void
