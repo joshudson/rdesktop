@@ -5329,8 +5329,8 @@ BackgroundBackStoreShutdown()
 		XFree(g_backstore2);
 		g_backstore2 = NULL;
 	}
+	XFlush(g_display); /* actually update the screen since we will block next */
 #ifdef PROFILE_SURGE
-	XFlush(g_display);
 	gettimeofday(&measure_stop, NULL);
 #endif
 #ifdef PROFILE_SURGE
